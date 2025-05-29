@@ -1,0 +1,176 @@
+  table_name          |      column_name       |          data_type          | character_maximum_length |               column_default               | is_nullable 
+------------------------------+------------------------+-----------------------------+--------------------------+--------------------------------------------+-------------
+ analytics                    | id                     | integer                     |                          | nextval('analytics_id_seq'::regclass)      | NO
+ analytics                    | question               | text                        |                          |                                            | NO
+ analytics                    | answer                 | text                        |                          |                                            | NO
+ analytics                    | feedback               | character varying           |                       50 |                                            | YES
+ analytics                    | sources                | jsonb                       |                          |                                            | YES
+ analytics                    | rouge1                 | double precision            |                          |                                            | YES
+ analytics                    | rouge2                 | double precision            |                          |                                            | YES
+ analytics                    | rougel                 | double precision            |                          |                                            | YES
+ analytics                    | bert_p                 | double precision            |                          |                                            | YES
+ analytics                    | bert_r                 | double precision            |                          |                                            | YES
+ analytics                    | bert_f1                | double precision            |                          |                                            | YES
+ analytics                    | cosine_similarity      | double precision            |                          |                                            | YES
+ analytics                    | response_time          | double precision            |                          |                                            | YES
+ analytics                    | user_id                | uuid                        |                          |                                            | YES
+ analytics                    | office_code            | text                        |                          |                                            | YES
+ analytics                    | chat_id                | character varying           |                      255 |                                            | YES
+ analytics                    | username               | text                        |                          |                                            | YES
+ analytics                    | title                  | text                        |                          |                                            | YES
+ analytics                    | timestamp              | timestamp without time zone |                          | CURRENT_TIMESTAMP                          | NO
+ chat_messages                | id                     | integer                     |                          | nextval('chat_messages_id_seq'::regclass)  | NO
+ chat_messages                | user_id                | uuid                        |                          |                                            | NO
+ chat_messages                | chat_id                | character varying           |                      255 |                                            | NO
+ chat_messages                | message_index          | integer                     |                          |                                            | NO
+ chat_messages                | sender                 | character varying           |                       50 |                                            | NO
+ chat_messages                | content                | text                        |                          |                                            | YES
+ chat_messages                | timestamp              | timestamp without time zone |                          | CURRENT_TIMESTAMP                          | YES
+ document_embeddings          | id                     | text                        |                          |                                            | NO
+ document_embeddings          | content                | text                        |                          |                                            | YES
+ document_embeddings          | embedding              | USER-DEFINED                |                          |                                            | YES
+ document_embeddings          | type                   | text                        |                          |                                            | YES
+ document_embeddings          | hash_document          | text                        |                          |                                            | YES
+ document_embeddings          | document_title         | text                        |                          |                                            | YES
+ document_embeddings          | category               | text                        |                          |                                            | YES
+ document_embeddings          | pdf_path               | text                        |                          |                                            | YES
+ document_embeddings          | hash_chapter           | text                        |                          |                                            | YES
+ document_embeddings          | chapter_title          | text                        |                          |                                            | YES
+ document_embeddings          | chapter_number         | text                        |                          |                                            | YES
+ document_embeddings          | hash_section           | text                        |                          |                                            | YES
+ document_embeddings          | section_title          | text                        |                          |                                            | YES
+ document_embeddings          | section_number         | text                        |                          |                                            | YES
+ document_embeddings          | section_page_number    | text                        |                          |                                            | YES
+ document_embeddings          | hash_subsection        | text                        |                          |                                            | YES
+ document_embeddings          | subsection_title       | text                        |                          |                                            | YES
+ document_embeddings          | subsection_number      | text                        |                          |                                            | YES
+ document_embeddings          | subsection_page_number | text                        |                          |                                            | YES
+ document_embeddings          | composite_id           | text                        |                          |                                            | YES
+ document_embeddings_airforce | content                | text                        |                          |                                            | YES
+ document_embeddings_airforce | embedding              | USER-DEFINED                |                          |                                            | YES
+ document_embeddings_airforce | type                   | text                        |                          |                                            | YES
+ document_embeddings_airforce | hash_document          | text                        |                          |                                            | YES
+ document_embeddings_airforce | document_title         | text                        |                          |                                            | YES
+ document_embeddings_airforce | category               | text                        |                          |                                            | YES
+ document_embeddings_airforce | pdf_path               | text                        |                          |                                            | YES
+ document_embeddings_airforce | hash_chapter           | text                        |                          |                                            | YES
+ document_embeddings_airforce | chapter_title          | text                        |                          |                                            | YES
+ document_embeddings_airforce | chapter_number         | text                        |                          |                                            | YES
+ document_embeddings_airforce | hash_section           | text                        |                          |                                            | YES
+ document_embeddings_airforce | section_title          | text                        |                          |                                            | YES
+ document_embeddings_airforce | section_number         | text                        |                          |                                            | YES
+ document_embeddings_airforce | section_page_number    | text                        |                          |                                            | YES
+ document_embeddings_airforce | hash_subsection        | text                        |                          |                                            | YES
+ document_embeddings_airforce | subsection_title       | text                        |                          |                                            | YES
+ document_embeddings_airforce | subsection_number      | text                        |                          |                                            | YES
+ document_embeddings_airforce | subsection_page_number | text                        |                          |                                            | YES
+ document_embeddings_airforce | composite_id           | text                        |                          |                                            | YES
+ document_embeddings_combined | id                     | text                        |                          |                                            | NO
+ document_embeddings_combined | content                | text                        |                          |                                            | YES
+ document_embeddings_combined | embedding              | USER-DEFINED                |                          |                                            | YES
+ document_embeddings_combined | type                   | text                        |                          |                                            | YES
+ document_embeddings_combined | hash_document          | text                        |                          |                                            | YES
+ document_embeddings_combined | document_title         | text                        |                          |                                            | YES
+ document_embeddings_combined | category               | text                        |                          |                                            | YES
+ document_embeddings_combined | pdf_path               | text                        |                          |                                            | YES
+ document_embeddings_combined | hash_chapter           | text                        |                          |                                            | YES
+ document_embeddings_combined | chapter_title          | text                        |                          |                                            | YES
+ document_embeddings_combined | chapter_number         | text                        |                          |                                            | YES
+ document_embeddings_combined | hash_section           | text                        |                          |                                            | YES
+ document_embeddings_combined | section_title          | text                        |                          |                                            | YES
+ document_embeddings_combined | section_number         | text                        |                          |                                            | YES
+ document_embeddings_combined | section_page_number    | text                        |                          |                                            | YES
+ document_embeddings_combined | hash_subsection        | text                        |                          |                                            | YES
+ document_embeddings_combined | subsection_title       | text                        |                          |                                            | YES
+ document_embeddings_combined | subsection_number      | text                        |                          |                                            | YES
+ document_embeddings_combined | subsection_page_number | text                        |                          |                                            | YES
+ document_embeddings_combined | composite_id           | text                        |                          |                                            | YES
+ document_embeddings_gs       | id                     | text                        |                          |                                            | NO
+ document_embeddings_gs       | content                | text                        |                          |                                            | YES
+ document_embeddings_gs       | embedding              | USER-DEFINED                |                          |                                            | YES
+ document_embeddings_gs       | type                   | text                        |                          |                                            | YES
+ document_embeddings_gs       | hash_document          | text                        |                          |                                            | YES
+ document_embeddings_gs       | document_title         | text                        |                          |                                            | YES
+ document_embeddings_gs       | category               | text                        |                          |                                            | YES
+ document_embeddings_gs       | pdf_path               | text                        |                          |                                            | YES
+ document_embeddings_gs       | hash_chapter           | text                        |                          |                                            | YES
+ document_embeddings_gs       | chapter_title          | text                        |                          |                                            | YES
+ document_embeddings_gs       | chapter_number         | text                        |                          |                                            | YES
+ document_embeddings_gs       | hash_section           | text                        |                          |                                            | YES
+ document_embeddings_gs       | section_title          | text                        |                          |                                            | YES
+ document_embeddings_gs       | section_number         | text                        |                          |                                            | YES
+ document_embeddings_gs       | section_page_number    | text                        |                          |                                            | YES
+ document_embeddings_gs       | hash_subsection        | text                        |                          |                                            | YES
+ document_embeddings_gs       | subsection_title       | text                        |                          |                                            | YES
+ document_embeddings_gs       | subsection_number      | text                        |                          |                                            | YES
+ document_embeddings_gs       | subsection_page_number | text                        |                          |                                            | YES
+ document_embeddings_gs       | composite_id           | text                        |                          |                                            | YES
+ document_embeddings_stratcom | id                     | text                        |                          |                                            | NO
+ document_embeddings_stratcom | content                | text                        |                          |                                            | YES
+ document_embeddings_stratcom | embedding              | USER-DEFINED                |                          |                                            | YES
+ document_embeddings_stratcom | type                   | text                        |                          |                                            | YES
+ document_embeddings_stratcom | hash_document          | text                        |                          |                                            | YES
+ document_embeddings_stratcom | document_title         | text                        |                          |                                            | YES
+ document_embeddings_stratcom | category               | text                        |                          |                                            | YES
+ document_embeddings_stratcom | pdf_path               | text                        |                          |                                            | YES
+ document_embeddings_stratcom | hash_chapter           | text                        |                          |                                            | YES
+ document_embeddings_stratcom | chapter_title          | text                        |                          |                                            | YES
+ document_embeddings_stratcom | chapter_number         | text                        |                          |                                            | YES
+ document_embeddings_stratcom | hash_section           | text                        |                          |                                            | YES
+ document_embeddings_stratcom | section_title          | text                        |                          |                                            | YES
+ document_embeddings_stratcom | section_number         | text                        |                          |                                            | YES
+ document_embeddings_stratcom | section_page_number    | text                        |                          |                                            | YES
+ document_embeddings_stratcom | hash_subsection        | text                        |                          |                                            | YES
+ document_embeddings_stratcom | subsection_title       | text                        |                          |                                            | YES
+ document_embeddings_stratcom | subsection_number      | text                        |                          |                                            | YES
+ document_embeddings_stratcom | subsection_page_number | text                        |                          |                                            | YES
+ document_embeddings_stratcom | composite_id           | text                        |                          |                                            | YES
+ feedback                     | id                     | integer                     |                          | nextval('feedback_id_seq'::regclass)       | NO
+ feedback                     | question               | text                        |                          |                                            | NO
+ feedback                     | answer                 | text                        |                          |                                            | NO
+ feedback                     | feedback               | character varying           |                       50 |                                            | YES
+ feedback                     | sources                | jsonb                       |                          |                                            | YES
+ feedback                     | rouge1                 | double precision            |                          |                                            | YES
+ feedback                     | rouge2                 | double precision            |                          |                                            | YES
+ feedback                     | rougel                 | double precision            |                          |                                            | YES
+ feedback                     | bert_p                 | double precision            |                          |                                            | YES
+ feedback                     | bert_r                 | double precision            |                          |                                            | YES
+ feedback                     | bert_f1                | double precision            |                          |                                            | YES
+ feedback                     | cosine_similarity      | double precision            |                          |                                            | YES
+ feedback                     | response_time          | double precision            |                          |                                            | YES
+ feedback                     | user_id                | uuid                        |                          |                                            | YES
+ feedback                     | office_code            | text                        |                          |                                            | YES
+ feedback                     | chat_id                | character varying           |                      255 |                                            | YES
+ feedback                     | username               | text                        |                          |                                            | YES
+ feedback                     | title                  | text                        |                          |                                            | YES
+ feedback                     | timestamp              | timestamp without time zone |                          |                                            | NO
+ message_sources              | message_id             | integer                     |                          |                                            | NO
+ message_sources              | title                  | text                        |                          |                                            | NO
+ message_sources              | content                | text                        |                          |                                            | YES
+ message_sources              | url                    | text                        |                          |                                            | YES
+ offices                      | office_id              | integer                     |                          | nextval('offices_office_id_seq'::regclass) | NO
+ offices                      | office_code            | text                        |                          |                                            | NO
+ offices                      | office_name            | text                        |                          |                                            | YES
+ sessions                     | user_id                | uuid                        |                          |                                            | NO
+ sessions                     | session_token          | character varying           |                      255 |                                            | NO
+ sessions                     | expires_at             | timestamp without time zone |                          |                                            | NO
+ user_chats                   | user_id                | uuid                        |                          |                                            | NO
+ user_chats                   | chat_id                | character varying           |                      255 |                                            | NO
+ user_chats                   | title                  | character varying           |                      255 |                                            | YES
+ user_chats                   | username               | character varying           |                      255 |                                            | YES
+ user_chats                   | office_code            | character varying           |                      255 |                                            | YES
+ user_preferences             | user_id                | uuid                        |                          |                                            | NO
+ user_preferences             | selected_model         | character varying           |                      255 | 'mistral:latest'::character varying        | YES
+ user_preferences             | temperature            | double precision            |                          | 1.0                                        | YES
+ user_preferences             | dataset                | character varying           |                       50 | 'KG'::character varying                    | YES
+ user_preferences             | persona                | character varying           |                      100 | 'None'::character varying                  | YES
+ user_preferences             | created_at             | timestamp without time zone |                          | now()                                      | YES
+ user_preferences             | updated_at             | timestamp without time zone |                          | now()                                      | YES
+ users                        | user_id                | uuid                        |                          |                                            | NO
+ users                        | username               | text                        |                          |                                            | NO
+ users                        | password_hash          | text                        |                          |                                            | NO
+ users                        | created_at             | timestamp without time zone |                          | now()                                      | NO
+ users                        | role                   | text                        |                          | 'user'::text                               | YES
+ users                        | office_code            | character varying           |                      255 |                                            | YES
+ users                        | is_admin               | boolean                     |                          | false                                      | YES
+ users                        | disabled               | boolean                     |                          | false                                      | YES

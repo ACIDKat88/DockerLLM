@@ -1,0 +1,33 @@
+# HTTP server
+server {
+    listen 80;
+    server_name ${DOMAIN_NAME};
+
+    # Include the locations configuration
+    include /etc/nginx/conf.d/locations.inc;
+}
+
+# HTTPS server (uncomment if SSL is enabled)
+# server {
+#     listen 443 ssl;
+#     server_name ${DOMAIN_NAME};
+#     
+#     # Only apply this server block if SSL is enabled
+#     set $use_https 0;
+#     if ($ssl_enabled = "true") {
+#         set $use_https 1;
+#     }
+#     
+#     if ($use_https = 0) {
+#         return 444;
+#     }
+# 
+#     # SSL configuration (only used if SSL_ENABLED=true)
+#     ssl_certificate /etc/letsencrypt/live/${DOMAIN_NAME}/fullchain.pem;
+#     ssl_certificate_key /etc/letsencrypt/live/${DOMAIN_NAME}/privkey.pem;
+#     ssl_protocols TLSv1.2 TLSv1.3;
+#     ssl_prefer_server_ciphers on;
+#     ssl_ciphers HIGH:!aNULL:!MD5;
+# 
+#     include /etc/nginx/conf.d/locations.inc;
+# } 

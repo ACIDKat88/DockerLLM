@@ -1,0 +1,49 @@
+version: '3.8'
+
+services:
+  fastapi:
+    volumes:
+      - ./models/qwen3-0.6b:/app/models/qwen3-0.6b
+      - ./docker_ragas_evaluator.py:/app/ragas_evaluator.py
+    environment:
+      - MODEL_PATH=/app/models/qwen3-0.6b
+      - USE_RAGAS_EVAL=true
+    depends_on:
+      ragas-init:
+        condition: service_completed_successfully
+
+  # Service to initialize and copy model files if needed
+  ragas-init:
+    build:
+      context: .
+      dockerfile: Dockerfile.ragas
+    volumes:
+      - ./models:/app/models
+    command: >
+      bash -c "
+        if [ ! -d /app/models/qwen3-0.6b ]; then
+          echo 'Model directory not found, please run the download_qwen_model.sh script first';
+          exit 1;
+        else
+          echo 'Model found in /app/models/qwen3-0.6b';
+          echo 'Verifying model files...';
+          
+          # Check for required model files
+          if [ ! -f /app/models/qwen3-0.6b/config.json ] || [ ! -f /app/models/qwen3-0.6b/tokenizer.json ]; then
+            echo 'Missing required model files. Please run download_qwen_model.sh';
+            exit 1;
+          fi
+          
+          echo 'Model verification complete!';
+          pip list | grep ragas;
+          pip list | grep transformers;
+          pip list | grep torch;
+          echo 'RAGAS initialization complete';
+        fi
+      "
+    healthcheck:
+      test: ["CMD", "test", "-d", "/app/models/qwen3-0.6b"]
+      interval: 5s
+      timeout: 5s
+      retries: 2
+      start_period: 5s 
