@@ -1,16 +1,16 @@
 
 ```sql
 -- Create sequences
-CREATE SEQUENCE analytics_id_seq;
-CREATE SEQUENCE chat_messages_id_seq;
-CREATE SEQUENCE feedback_id_seq;
-CREATE SEQUENCE offices_office_id_seq;
+CREATE SEQUENCE public.analytics_id_seq;
+CREATE SEQUENCE public.chat_messages_id_seq;
+CREATE SEQUENCE public.feedback_id_seq;
+CREATE SEQUENCE public.offices_office_id_seq;
 
 -- Create vector extension for embeddings
 CREATE EXTENSION IF NOT EXISTS vector;
 
 -- Create tables
-CREATE TABLE analytics (
+CREATE TABLE public.analytics (
     id integer NOT NULL DEFAULT nextval('analytics_id_seq'::regclass),
     question text NOT NULL,
     answer text NOT NULL,
@@ -33,7 +33,7 @@ CREATE TABLE analytics (
     PRIMARY KEY (id)
 );
 
-CREATE TABLE chat_messages (
+CREATE TABLE public.chat_messages (
     id integer NOT NULL DEFAULT nextval('chat_messages_id_seq'::regclass),
     user_id uuid NOT NULL,
     chat_id character varying(255) NOT NULL,
@@ -44,7 +44,7 @@ CREATE TABLE chat_messages (
     PRIMARY KEY (id)
 );
 
-CREATE TABLE document_embeddings (
+CREATE TABLE public.document_embeddings (
     id text NOT NULL,
     content text,
     embedding vector,
@@ -68,7 +68,7 @@ CREATE TABLE document_embeddings (
     PRIMARY KEY (id)
 );
 
-CREATE TABLE document_embeddings_airforce (
+CREATE TABLE public.document_embeddings_airforce (
     content text,
     embedding vector,
     type text,
@@ -90,7 +90,7 @@ CREATE TABLE document_embeddings_airforce (
     composite_id text
 );
 
-CREATE TABLE document_embeddings_combined (
+CREATE TABLE public.document_embeddings_combined (
     id text NOT NULL,
     content text,
     embedding vector,
@@ -114,7 +114,7 @@ CREATE TABLE document_embeddings_combined (
     PRIMARY KEY (id)
 );
 
-CREATE TABLE document_embeddings_gs (
+CREATE TABLE public.document_embeddings_gs (
     id text NOT NULL,
     content text,
     embedding vector,
@@ -138,7 +138,7 @@ CREATE TABLE document_embeddings_gs (
     PRIMARY KEY (id)
 );
 
-CREATE TABLE document_embeddings_stratcom (
+CREATE TABLE public.document_embeddings_stratcom (
     id text NOT NULL,
     content text,
     embedding vector,
@@ -162,7 +162,7 @@ CREATE TABLE document_embeddings_stratcom (
     PRIMARY KEY (id)
 );
 
-CREATE TABLE feedback (
+CREATE TABLE public.feedback (
     id integer NOT NULL DEFAULT nextval('feedback_id_seq'::regclass),
     question text NOT NULL,
     answer text NOT NULL,
@@ -185,7 +185,7 @@ CREATE TABLE feedback (
     PRIMARY KEY (id)
 );
 
-CREATE TABLE message_sources (
+CREATE TABLE public.message_sources (
     message_id integer NOT NULL,
     title text NOT NULL,
     content text,
@@ -194,7 +194,7 @@ CREATE TABLE message_sources (
 );
 
 -- 1) Create the table
-CREATE TABLE office (
+CREATE TABLE public.office (
   office_id   INTEGER     PRIMARY KEY,
   office_code TEXT        NOT NULL,
   office_name TEXT        NOT NULL
@@ -215,14 +215,14 @@ INSERT INTO office (office_id, office_code, office_name) VALUES
   (11, 'NEC','NC3 Enterprise Center');
 
 
-CREATE TABLE sessions (
+CREATE TABLE public.sessions (
     user_id uuid NOT NULL,
     session_token character varying(255) NOT NULL,
     expires_at timestamp without time zone NOT NULL,
     PRIMARY KEY (user_id, session_token)
 );
 
-CREATE TABLE user_chats (
+CREATE TABLE public.user_chats (
     user_id uuid NOT NULL,
     chat_id character varying(255) NOT NULL,
     title character varying(255),
@@ -231,7 +231,7 @@ CREATE TABLE user_chats (
     PRIMARY KEY (user_id, chat_id)
 );
 
-CREATE TABLE user_preferences (
+CREATE TABLE public.user_preferences (
     user_id uuid NOT NULL,
     selected_model character varying(255) DEFAULT 'mistral:latest'::character varying,
     temperature double precision DEFAULT 1.0,
@@ -242,7 +242,7 @@ CREATE TABLE user_preferences (
     PRIMARY KEY (user_id)
 );
 
-CREATE TABLE users (
+CREATE TABLE public.users (
     user_id uuid NOT NULL,
     username text NOT NULL,
     password_hash text NOT NULL,
