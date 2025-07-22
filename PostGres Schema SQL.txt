@@ -1,0 +1,252 @@
+
+```sql
+-- Create sequences
+CREATE SEQUENCE analytics_id_seq;
+CREATE SEQUENCE chat_messages_id_seq;
+CREATE SEQUENCE feedback_id_seq;
+CREATE SEQUENCE offices_office_id_seq;
+
+-- Create vector extension for embeddings
+CREATE EXTENSION IF NOT EXISTS vector;
+
+-- Create tables
+CREATE TABLE analytics (
+    id integer NOT NULL DEFAULT nextval('analytics_id_seq'::regclass),
+    question text NOT NULL,
+    answer text NOT NULL,
+    feedback character varying(50),
+    sources jsonb,
+    rouge1 double precision,
+    rouge2 double precision,
+    rougel double precision,
+    bert_p double precision,
+    bert_r double precision,
+    bert_f1 double precision,
+    cosine_similarity double precision,
+    response_time double precision,
+    user_id uuid,
+    office_code text,
+    chat_id character varying(255),
+    username text,
+    title text,
+    timestamp timestamp without time zone NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (id)
+);
+
+CREATE TABLE chat_messages (
+    id integer NOT NULL DEFAULT nextval('chat_messages_id_seq'::regclass),
+    user_id uuid NOT NULL,
+    chat_id character varying(255) NOT NULL,
+    message_index integer NOT NULL,
+    sender character varying(50) NOT NULL,
+    content text,
+    timestamp timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (id)
+);
+
+CREATE TABLE document_embeddings (
+    id text NOT NULL,
+    content text,
+    embedding vector,
+    type text,
+    hash_document text,
+    document_title text,
+    category text,
+    pdf_path text,
+    hash_chapter text,
+    chapter_title text,
+    chapter_number text,
+    hash_section text,
+    section_title text,
+    section_number text,
+    section_page_number text,
+    hash_subsection text,
+    subsection_title text,
+    subsection_number text,
+    subsection_page_number text,
+    composite_id text,
+    PRIMARY KEY (id)
+);
+
+CREATE TABLE document_embeddings_airforce (
+    content text,
+    embedding vector,
+    type text,
+    hash_document text,
+    document_title text,
+    category text,
+    pdf_path text,
+    hash_chapter text,
+    chapter_title text,
+    chapter_number text,
+    hash_section text,
+    section_title text,
+    section_number text,
+    section_page_number text,
+    hash_subsection text,
+    subsection_title text,
+    subsection_number text,
+    subsection_page_number text,
+    composite_id text
+);
+
+CREATE TABLE document_embeddings_combined (
+    id text NOT NULL,
+    content text,
+    embedding vector,
+    type text,
+    hash_document text,
+    document_title text,
+    category text,
+    pdf_path text,
+    hash_chapter text,
+    chapter_title text,
+    chapter_number text,
+    hash_section text,
+    section_title text,
+    section_number text,
+    section_page_number text,
+    hash_subsection text,
+    subsection_title text,
+    subsection_number text,
+    subsection_page_number text,
+    composite_id text,
+    PRIMARY KEY (id)
+);
+
+CREATE TABLE document_embeddings_gs (
+    id text NOT NULL,
+    content text,
+    embedding vector,
+    type text,
+    hash_document text,
+    document_title text,
+    category text,
+    pdf_path text,
+    hash_chapter text,
+    chapter_title text,
+    chapter_number text,
+    hash_section text,
+    section_title text,
+    section_number text,
+    section_page_number text,
+    hash_subsection text,
+    subsection_title text,
+    subsection_number text,
+    subsection_page_number text,
+    composite_id text,
+    PRIMARY KEY (id)
+);
+
+CREATE TABLE document_embeddings_stratcom (
+    id text NOT NULL,
+    content text,
+    embedding vector,
+    type text,
+    hash_document text,
+    document_title text,
+    category text,
+    pdf_path text,
+    hash_chapter text,
+    chapter_title text,
+    chapter_number text,
+    hash_section text,
+    section_title text,
+    section_number text,
+    section_page_number text,
+    hash_subsection text,
+    subsection_title text,
+    subsection_number text,
+    subsection_page_number text,
+    composite_id text,
+    PRIMARY KEY (id)
+);
+
+CREATE TABLE feedback (
+    id integer NOT NULL DEFAULT nextval('feedback_id_seq'::regclass),
+    question text NOT NULL,
+    answer text NOT NULL,
+    feedback character varying(50),
+    sources jsonb,
+    rouge1 double precision,
+    rouge2 double precision,
+    rougel double precision,
+    bert_p double precision,
+    bert_r double precision,
+    bert_f1 double precision,
+    cosine_similarity double precision,
+    response_time double precision,
+    user_id uuid,
+    office_code text,
+    chat_id character varying(255),
+    username text,
+    title text,
+    timestamp timestamp without time zone NOT NULL,
+    PRIMARY KEY (id)
+);
+
+CREATE TABLE message_sources (
+    message_id integer NOT NULL,
+    title text NOT NULL,
+    content text,
+    url text,
+    PRIMARY KEY (message_id, title)
+);
+
+CREATE TABLE offices (
+    office_id integer NOT NULL DEFAULT nextval('offices_office_id_seq'::regclass),
+    office_code text NOT NULL,
+    office_name text,
+    PRIMARY KEY (office_id)
+);
+
+CREATE TABLE sessions (
+    user_id uuid NOT NULL,
+    session_token character varying(255) NOT NULL,
+    expires_at timestamp without time zone NOT NULL,
+    PRIMARY KEY (user_id, session_token)
+);
+
+CREATE TABLE user_chats (
+    user_id uuid NOT NULL,
+    chat_id character varying(255) NOT NULL,
+    title character varying(255),
+    username character varying(255),
+    office_code character varying(255),
+    PRIMARY KEY (user_id, chat_id)
+);
+
+CREATE TABLE user_preferences (
+    user_id uuid NOT NULL,
+    selected_model character varying(255) DEFAULT 'mistral:latest'::character varying,
+    temperature double precision DEFAULT 1.0,
+    dataset character varying(50) DEFAULT 'KG'::character varying,
+    persona character varying(100) DEFAULT 'None'::character varying,
+    created_at timestamp without time zone DEFAULT now(),
+    updated_at timestamp without time zone DEFAULT now(),
+    PRIMARY KEY (user_id)
+);
+
+CREATE TABLE users (
+    user_id uuid NOT NULL,
+    username text NOT NULL,
+    password_hash text NOT NULL,
+    created_at timestamp without time zone NOT NULL DEFAULT now(),
+    role text DEFAULT 'user'::text,
+    office_code character varying(255),
+    is_admin boolean DEFAULT false,
+    disabled boolean DEFAULT false,
+    PRIMARY KEY (user_id)
+);
+
+-- Add foreign key constraints
+ALTER TABLE analytics ADD FOREIGN KEY (user_id) REFERENCES users(user_id);
+ALTER TABLE chat_messages ADD FOREIGN KEY (user_id) REFERENCES users(user_id);
+ALTER TABLE user_preferences ADD FOREIGN KEY (user_id) REFERENCES users(user_id);
+ALTER TABLE sessions ADD FOREIGN KEY (user_id) REFERENCES users(user_id);
+ALTER TABLE user_chats ADD FOREIGN KEY (user_id) REFERENCES users(user_id);
+ALTER TABLE analytics ADD FOREIGN KEY (office_code) REFERENCES offices(office_code);
+ALTER TABLE feedback ADD FOREIGN KEY (office_code) REFERENCES offices(office_code);
+ALTER TABLE users ADD FOREIGN KEY (office_code) REFERENCES offices(office_code);
+ALTER TABLE message_sources ADD FOREIGN KEY (message_id) REFERENCES chat_messages(id);
+```
