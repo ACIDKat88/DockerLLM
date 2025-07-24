@@ -1,0 +1,194 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/neuro-inc/neuro-flow/refs/heads/master/src/apolo_flow/flow-schema.json
+kind: live
+title: docker-llm
+defaults:
+  life_span: 1d
+  # volumes:
+  #   - storage:some/path:/path/in/job
+  #   - storage://absolute/path:/different/path/in/job
+  # Default volumes are not passed to actions.
+
+images:
+  frontend:
+    ref: image:/$[[ project.project_name ]]/dockerllm/frontend:latest
+    context: ./front-end-app
+    dockerfile: ${{ flow.workspace }}/front-end-app/Dockerfile
+  backend: 
+    ref: image:/$[[ project.project_name ]]/dockerllm/backend:latest
+    context: ./fast-api
+    dockerfile: ${{ flow.workspace }}/fast-api/Dockerfile
+    build_preset: cpu-4-20
+  db_loader:
+    ref: image:/$[[ project.project_name ]]/dockerllm/db_loader:latest
+    context: ./databases
+    dockerfile: ${{ flow.workspace }}/databases/Dockerfile
+    build_preset: cpu-4-20
+  nginx:
+    ref: image:/$[[ project.project_name ]]/dockerllm/nginx:latest
+    context: ./nginx
+    dockerfile: ${{ flow.workspace }}/nginx/Dockerfile
+
+
+volumes:
+  frontend:
+    remote: storage:/$[[ project.project_name ]]/dockerllm/frontend
+    mount: /app/frontend
+    local: ./front-end-app
+  cache:
+    remote: storage:/$[[ project.project_name ]]/dockerllm/cache
+    mount: /home/appuser/.cache/huggingface
+    local: backend_hf_cache
+  backend:
+    remote: storage:/$[[ project.project_name ]]/dockerllm/backend
+    mount: /app/models
+    local: ./fast-api/models
+  static_files:
+    remote: storage:/$[[ project.project_name ]]/dockerllm/static_files
+    mount: /static_files
+    local: ./cleaned
+  postgres:
+    remote: storage:/$[[ project.project_name ]]/dockerllm/postgres
+    mount: /var/lib/postgresql/data
+    local: postgres_data
+  neo4j_data:
+    remote: storage:/$[[ project.project_name ]]/dockerllm/neo4j_data
+    mount: /data
+    local: neo4j_data
+  neo4j_logs:
+    remote: storage:/$[[ project.project_name ]]/dockerllm/neo4j_logs
+    mount: /logs
+    local: neo4j_logs
+  db_loader_models: 
+    remote: storage:/$[[ project.project_name ]]/dockerllm/db_loader_models
+    mount: /app/models
+    local: ./databases/models 
+  db_loader_cache: 
+    remote: storage:/$[[ project.project_name ]]/dockerllm/db_loader_cache
+    mount: /root/.cache/huggingface
+    local: db_loader_hf_cache
+  db_loader: 
+    remote: storage:/$[[ project.project_name ]]/dockerllm/db_loader/databases
+    mount: /app
+    local: ./databases
+  ollama:
+    remote: storage:/$[[ project.project_name ]]/dockerllm/ollama
+    mount: /root/.ollama
+    local: ollama_data
+
+  
+  
+jobs:
+  # Frontend Service
+  frontend:
+    image: $[[ images.frontend.ref ]]
+    http_auth: false
+    detach: True
+    http_port: 5173
+    env: 
+      NODE_ENV: production
+      VITE_API_URL: https://docker-llm-frontend--6b5efca2ab.jobs.scottdc.org.apolo.scottdata.ai/
+      # VITE_API_URL: ${{ inspect_job('backend').internal_hostname_named }}
+
+  # Backend FastAPI Service
+  backend:
+    image: $[[ images.backend.ref ]]
+    http_auth: false
+    http_port: 8000
+    volumes:
+      - $[[ upload(volumes.backend).ref_rw ]]
+      - $[[ volumes.cache.ref_rw ]]
+      - $[[ volumes.static_files.ref_rw ]]
+      - $[[ volumes.frontend.ref_rw ]]
+    preset: H100x1
+    env:
+      HF_TOKEN: secret:HF_TOKEN
+      DB_HOST: ${{ inspect_job('postgres').internal_hostname_named }}
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: postgres
+      NEO4J_URI: neo4j://${{ inspect_job('neo4j').internal_hostname_named }}
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: password
+      OLLAMA_HOST: ollama
+      OLLAMA_BASE_URL: "http://${{ inspect_job('ollama').internal_hostname_named }}"
+      STATIC_FILES_PATH: /static_files
+      MODEL_PATH: /app/models/mxbai-embed-large-v1
+      CROSS_ENCODER_PATH: /app/models/cross-encoder
+      TRANSFORMERS_CACHE: home/appuser/.cache/huggingface/transformers
+      HF_HOME: /home/appuser/.cache/huggingface
+      XDG_CACHE_HOME: /home/appuser/.cache 
+  
+  # PostgreSQL Database
+  postgres:
+    image: ankane/pgvector:latest
+    http_auth: false
+    detach: True
+    env:
+      POSTGRES_HOST: docker-llm-postgres--6b5efca2ab.platform--j-6--chatbot--f4045690a8e475fc389a60ca
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: j1chat
+    volumes:
+      - $[[ volumes.postgres.ref_rw ]]
+  
+  # Neo4j Database 
+  neo4j:
+    image: neo4j:5.11.0
+    detach: True
+    env:
+      NEO4J_AUTH: neo4j/password
+      NEO4J_PLUGINS: '["apoc"]'
+    http_port: 7474
+    volumes:
+      - $[[ volumes.neo4j_data.ref_rw ]]
+      - $[[ volumes.neo4j_logs.ref_rw ]]
+
+  # Database Loader Service
+  db_loader:
+    image:  $[[ images.db_loader.ref ]]
+    preset: H100x1
+    http_auth: false
+    volumes:
+      -  $[[ volumes.db_loader_models.ref_rw ]]
+      - $[[ volumes.db_loader_cache.ref_rw ]]
+      - $[[ upload(volumes.db_loader).ref_rw ]]
+    
+    env:
+      POSTGRES_HOST: docker-llm-postgres--6b5efca2ab.platform--j-6--chatbot--f4045690a8e475fc389a60ca
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: j1chat
+      NEO4J_URI: neo4j://${{ inspect_job('neo4j').internal_hostname_named }}
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: password
+
+  # Nginx Service
+  nginx:
+    image: $[[ images.nginx.ref ]]
+    http_auth: false
+    detach: True
+    http_port: 80
+    env:
+      BACKEND_SERVICE: docker-llm-backend--6b5efca2ab.platform--j-6--chatbot--f4045690a8e475fc389a60ca:8000
+      FRONTEND_DOMAIN: docker-llm-frontend--6b5efca2ab.jobs.scottdc.org.apolo.scottdata.ai
+
+  # Ollama Service
+  ollama: 
+    image: ollama/ollama:latest
+    detach: True
+    http_auth: false
+    http_port: 11434
+    volumes:
+      - $[[ volumes.ollama.ref_rw ]]
+    preset: H100x1
+
+  # pgAdmin Service
+  pgadmin:
+    image: dpage/pgadmin4
+    detach: True
+    env:
+      PGADMIN_DEFAULT_EMAIL: admin@admin.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+      PGADMIN_LISTEN_PORT: '5050'
+    http_port: 5050
+

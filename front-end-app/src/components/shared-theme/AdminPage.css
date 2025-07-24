@@ -1,0 +1,59 @@
+/* Ensure DataGrid header and footer span 100% of the container */
+.MuiDataGrid-columnHeaders,
+.MuiDataGrid-footerContainer {
+  width: 100% !important;
+  box-sizing: border-box;
+}
+
+
+/* Base container for the Admin Dashboard */
+.admin-outer-container {
+  width: 100%;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  padding: 0;
+}
+
+/* Header area (if needed, e.g., for the AppBar or title section) */
+.admin-header {
+  padding: 10px;
+  border-bottom: 1px solid #ccc;
+}
+
+/* Main content area, which holds user management, analytics, etc. */
+.admin-main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  background-color: #f9f9f9; /* a light background for contrast */
+  overflow-y: auto;
+  padding: 20px;
+}
+
+/* Section container for distinct panels (user management, analytics, etc.) */
+.admin-section {
+  background: #fff;
+  padding: 20px;
+  margin-bottom: 20px;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+}
+
+/* DataGrid container styling */
+.admin-datagrid {
+  height: 400px; /* maintain a fixed height for the grid */
+  width: 100%;
+}
+
+/* Responsive adjustments for mobile devices */
+@media (max-width: 768px) {
+  .admin-outer-container {
+    height: auto;
+    flex-direction: column;
+  }
+  .admin-main {
+    padding: 10px;
+  }
+}

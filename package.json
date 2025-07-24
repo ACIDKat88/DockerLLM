@@ -1,0 +1,15 @@
+{
+  "name": "full-project",
+  "private": true,
+  "version": "1.0.0",
+  "scripts": {
+    "dev:all": "concurrently \"cd flask-api && uvicorn api_app:app --host 0.0.0.0 --port 8000 --log-level debug\" \"cd front-end-app && QT_QPA_PLATFORM=offscreen npx vite --host\""
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  },
+  "dependencies": {
+    "pdfjs-dist": "^5.0.375",
+    "react-pdf": "^9.2.1"
+  }
+}

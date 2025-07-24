@@ -1,0 +1,8 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/neuro-inc/neuro-flow/refs/heads/master/src/apolo_flow/project-schema.json
+## Keep the preceding line to enable code completion for the project configuration file.
+## Check our full reference documentation at https://docs.apolo.us/apolo-flow-reference/workflow-syntax/project-configuration-syntax
+id: docker_llm
+## Could be referenced as $[[ project.id ]] or $[[ flow.project_id ]] contexts.
+## Default value: name of the folder containing `.apolo`
+# project_name: <your-project-name>
+## Optional platform project name that owns the flow, referenced via $[[ project.project_name ]]

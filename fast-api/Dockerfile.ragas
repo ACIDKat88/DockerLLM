@@ -1,0 +1,47 @@
+FROM python:3.10-slim
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    curl \
+    software-properties-common \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements
+COPY requirements.txt .
+
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Install RAGAS and HuggingFace Transformers
+RUN pip install --no-cache-dir ragas langchain-community transformers torch --extra-index-url https://download.pytorch.org/whl/cpu
+
+# Copy the model file (will be mounted at runtime)
+# VOLUME /app/models
+
+# Copy the evaluator code
+COPY docker_ragas_evaluator.py /app/ragas_evaluator.py
+
+# Create symbolic link to standard location
+RUN ln -s /app/ragas_evaluator.py /app/ragas_evaluator.py
+
+# Set environment variables
+ENV PYTHONPATH=/app
+ENV MODEL_PATH=/app/models/qwen3-0.6b
+
+# Create directories
+RUN mkdir -p /app/models
+
+# Add healthcheck
+HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
+    CMD python -c "import os; exit(0 if os.path.exists('/app/models/qwen3-0.6b') else 1)"
+
+# Display a message about model mounting
+RUN echo '#!/bin/bash\necho "RAGAS evaluator is running. Make sure to mount the model directory with -v /path/to/models:/app/models"\necho "Looking for model in $MODEL_PATH"\nif [ -d "$MODEL_PATH" ]; then\n  echo "Model found!"\nelse\n  echo "Model not found. Please check your volume mounts."\nfi\n# Run the original command\nexec "$@"' > /entrypoint.sh \
+    && chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["python", "-c", "import ragas_evaluator; print('RAGAS evaluator loaded successfully')"] 
