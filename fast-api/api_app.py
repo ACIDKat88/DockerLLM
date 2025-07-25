@@ -100,6 +100,7 @@ SECRET_KEY = "YOUR_SECRET_KEY"  # Replace with a strong secret in production
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_HOURS = 24  # token valid for 24 hours
 OLLAMA_API_URL = "https://docker-llm-ollama--6b5efca2ab.jobs.scottdc.org.apolo.scottdata.ai/api/chat"
+# neo4j_uri = "neo4j://docker-llm-neo4j--6b5efca2ab.platform--j-6--chatbot--f4045690a8e475fc389a60ca"
 ALLOWED_ROOT = Path("/home/cm36/Updated-LLM-Project/J1_corpus/cleaned")
 AVAILABLE_MODELS = ["mistral:latest", "sskostyaev/mistral:7b-instruct-v0.2-q6_K-32k", "mistral:7b-instruct-v0.3-q3_K_M"]
 SIMILARITY_THRESHOLD = 0.3
@@ -1630,75 +1631,27 @@ def is_appropriate_content(text):
     
     return True, None
 
+# --- Simplified /api/chat endpoint ---
 @app.post("/api/chat")
-async def chat_stream(request: Request, current_user: dict = Depends(get_current_user)):
-    # Extract parameters from JSON payload.
+async def chat_stream(request: Request):
     data = await request.json()
     user_message = data.get("message", "")
     model_name = data.get("model", AVAILABLE_MODELS[0])
     temperature = float(data.get("temperature", 1.0))
     dataset_option = data.get("dataset", "KG")
-    raw_persona = data.get("persona")
-    print(f"[DEBUG /api/chat] Raw 'persona' from request  {raw_persona}")
-    personality = raw_persona if raw_persona is not None else "None"
-    print(f"[DEBUG /api/chat] Effective 'personality' after default: {personality}")
-    print(f"[DEBUG /api/chat] Value of 'personality' BEFORE calling load_personality: {personality}")
-    prompt_prefix = load_personality(personality)
-    print(f"[DEBUG /api/chat] Result from load_personality (prefix length): {len(prompt_prefix)}")
-    
-    user_id = current_user.get("user_id")
+
     if not user_message:
         raise HTTPException(status_code=400, detail="Message cannot be empty")
-
-    # Check if the message contains inappropriate content
-    is_appropriate, reason = is_appropriate_content(user_message)
-    if not is_appropriate:
-        async def rejection_generator():
-            rejection_message = {
-                "token": f"I'm sorry, but I cannot respond to this message because it may contain inappropriate content. {reason}. Please revise your question."
-            }
-            yield f" {json.dumps(rejection_message)}\n\n"
-            yield " [DONE]\n\n"
-        print(f"[CONTENT REJECTED] User: {user_id}, Message: {user_message}, Reason: {reason}")
-        return StreamingResponse(
-            rejection_generator(),
-            media_type="text/event-stream"
-        )
-
-    chat_id = data.get("chat_id")
-    if not chat_id:
-        chat_id = generate_chat_id()
-        chat_title = data.get("chat_title", "Untitled Chat")
-        await set_chat_title(user_id, chat_id, chat_title)
-
-    recent_chat_history = await load_chat_history(user_id, chat_id)
-    chat_history_context = ""
-    if recent_chat_history:
-        if await async_is_topic_change(user_message, recent_chat_history, embedding_function):
-            print("Detected a new topic - ignoring previous chat history.")
-        else:
-            last_three = recent_chat_history[-3:]
-            for entry in last_three:
-                user_text = entry.get('user', '')
-                bot_text = entry.get('bot')
-                if isinstance(bot_text, dict) and 'content' in bot_text:
-                    bot_text = bot_text['content']
-                chat_history_context += f"User: {user_text}\nBot: {bot_text}\n\n"
-    else:
-        chat_history_context = ""
 
     retrieved_docs = []
     context = ""
     node_count = None
     try:
-        print(f"[DEBUG] Dataset option: {dataset_option}")
-        print(f"[DEBUG] User query: {user_message}")
         loop = asyncio.get_event_loop()
 
         if dataset_option == "None":
             print("[DEBUG] Dataset is 'None', skipping document retrieval.")
             node_count = 0
-            pass
         elif dataset_option == "KG":
             print(f"[DEBUG] Using dataset: 'KG' with Neo4j and PostgreSQL table: 'document_embeddings_combined'")
             context, retrieved_docs, node_count = await async_cypher_retriever(
@@ -1767,47 +1720,15 @@ async def chat_stream(request: Request, current_user: dict = Depends(get_current
                 print("[DEBUG] No documents retrieved from combined retriever.")
                 retrieved_docs = []
                 context = ""
-                
+
     except Exception as e:
         print(f"[ERROR] Exception in document retrieval: {e}")
-        node_count = None
         context = ""
-        retrieved_docs = []
 
-    combined_context = f"{chat_history_context}\n\n{context.strip()}".strip()
-    print(f"[DEBUG] Final combined context (first 500 chars): {combined_context[:500]}")
-    
-    if combined_context:
-        final_prompt = f"Context:\n{combined_context}\n\nUser Query:\n{user_message}"
-    else:
-        final_prompt = f"User Query:\n{user_message}"
-        
-    if prompt_prefix:
-        print(f"[DEBUG] Adding prompt for personality: {personality}")
-        print(f"[DEBUG] Prompt before adding personality: {final_prompt[:100]}...")
-        final_prompt = f"{prompt_prefix}\n\n{final_prompt}"
-        print(f"[DEBUG] Prompt after adding personality (first 300 chars):\n{final_prompt[:300]}")
-        
-        if "You are a J1 Chatbot" in prompt_prefix:
-            print(f"[DEBUG] Common instructions are included in the prompt")
-        
-        if "If \"None\" dataset is selected" in prompt_prefix:
-            print(f"[DEBUG] Dataset-specific instructions included in prompt")
-        
-        if personality != "None" and f"You are a {personality.lower()}" in prompt_prefix:
-            print(f"[DEBUG] Role-specific instructions for '{personality}' included in prompt")
-    else:
-        print(f"[DEBUG] Warning: No prompt_prefix loaded!")
+    final_prompt = f"Context:\n{context}\n\nUser Query:\n{user_message}"
 
-    print(f"[DEBUG] Final prompt sent to LLM (first 500 chars):\n{final_prompt[:500]}")
-
-    # --- Direct API Call Implementation ---
     async def token_generator():
-
         full_response = ""
-        cleaned_response = ""
-        stream_start = time.perf_counter()
-        log_analytics_called = False
         try:
             payload = {
                 "model": model_name,
@@ -1826,289 +1747,31 @@ async def chat_stream(request: Request, current_user: dict = Depends(get_current
                         data = json.loads(decoded_line)
                         if "message" in data and "content" in data["message"]:
                             token = data["message"]["content"]
-                            full_response += token  # Accumulate tokens
-                            yield f" {json.dumps({'token': token})}\n\n"
+                            full_response += token
+                            yield f"{json.dumps({'token': token})}\n"  # Add newline for JSON Lines
 
                         if "done" in data and data["done"]:
                             cleaned_response = clean_llm_response(full_response)
-                            yield f" {json.dumps({'final_text': cleaned_response})}\n\n"
+                            yield f"{json.dumps({'final_text': cleaned_response})}\n"  # Add newline
                             yield " [DONE]\n\n"
-                            break  # End the stream
+                            break
                     except json.JSONDecodeError:
-                        # Handle non-JSON lines (if any)
                         print(f"[Skipping non-JSON line: {decoded_line}")
-                        yield f" {json.dumps({'token': decoded_line})}\n\n" # Send the raw text
-                        full_response += decoded_line  # Accumulate raw text
-                        # If a line is not JSON, it is not likely the last
-                        # If you are seeing errors, also check the model parameters
-                        # to ensure it is outputting valid JSON
-
-            cleaned_response = clean_llm_response(full_response)
-            # Removed the following lines because the stream already sends final_text, and [DONE]
-            # yield f" {json.dumps({'final_text': cleaned_response})}\n\n"
-            # yield " [DONE]\n\n"
-            print("[DEBUG /api/chat] Stream finished successfully.")
+                        yield f"{json.dumps({'token': decoded_line})}\n"  # Add newline
+                        full_response += decoded_line
 
         except requests.exceptions.RequestException as e:
             print(f"[ERROR /api/chat] Request failed: {e}")
-            yield f" {json.dumps({'error': f'Request failed: {e}'})}\n\n"
+            yield f"{json.dumps({'error': f'Request failed: {e}'})}\n"  # Add newline
             yield " [DONE]\n\n"
             return
         except Exception as e:
             print(f"[ERROR /api/chat] An unexpected error occurred: {e}")
-            yield f" {json.dumps({'error': f'An unexpected error occurred: {e}'})}\n\n"
+            yield f"{json.dumps({'error': f'An unexpected error occurred: {e}'})}\n"  # Add newline
             yield " [DONE]\n\n"
             return
 
-        stream_elapsed = time.perf_counter() - stream_start
-        print(f"Streamed response in {stream_elapsed:.3f} seconds")
-        print(f"[DEBUG /api/chat] Calculated stream_elapsed: {stream_elapsed}") 
-        
-        print(f"[DEBUG /api/chat] Raw LLM response (full_response):\n'''{full_response}'''")
-        cleaned_response = clean_llm_response(full_response) 
-        print(f"[DEBUG /api/chat] Cleaned LLM response (cleaned_response):\n'''{cleaned_response}'''")
-
-
-        
-        # --- Compute Metrics --- 
-        metrics = {} 
-        try:
-            print("[DEBUG /api/chat] Calculating metrics...")
-            metrics = compute_metrics(cleaned_response, user_message, embedding_function, stream_elapsed)
-            print(f"[DEBUG /api/chat] Metrics calculated: {metrics}")
-        except Exception as metrics_error:
-             print(f"[ERROR /api/chat] Error calculating metrics: {metrics_error}")
-             import traceback
-             traceback.print_exc()
-             # Decide if you want to proceed without metrics or stop
-             # For now, we'll proceed but log the error
-
-        # --- Source Processing --- 
-        sources_json = None 
-        try:
-            # print("[DEBUG /api/chat] Processing sources...") # Commented out
-            if dataset_option != "None" and retrieved_docs: # Check if docs exist
-                source_tuples = []
-                for chunk in retrieved_docs: 
-                    src = extract_source_from_metadata(chunk)
-                    paragraph = chunk.page_content if hasattr(chunk, "page_content") else chunk.get("content")
-                    source_tuples.append((src, paragraph))
-                
-                sources_json = await display_sources_with_paragraphs(source_tuples, dataset=dataset_option)
-                yield f" {json.dumps({'sources': sources_json})}\n\n"
-                # print("[DEBUG /api/chat] Sources processed and yielded.") # Commented out
-            else:
-                # print("[DEBUG /api/chat] No dataset or no retrieved docs, skipping source processing.") # Commented out
-                pass # Explicitly do nothing if no sources needed
-        except Exception as source_error:
-             print(f"[ERROR /api/chat] Error processing sources: {source_error}")
-             import traceback
-             traceback.print_exc()
-             # Decide if you want to proceed without sources or stop
-             # For now, we'll proceed but log the error
-             
-        # --- Record Chat History --- 
-        try:
-            print("[DEBUG /api/chat] Adding to chat history...")
-            await add_to_chat_history(user_id, chat_id, user_message, cleaned_response, sources_json)
-            print("[DEBUG /api/chat] Added to chat history.")
-        except Exception as history_error:
-             print(f"[ERROR /api/chat] Error adding to chat history: {history_error}")
-             import traceback
-             traceback.print_exc()
-             # This might be critical, maybe re-raise or handle differently
-
-        # --- Integrated Analytics Logging --- 
-        try:
-            print("[DEBUG /api/chat] Preparing analytics payload...")
-            # ... (existing code to get actual_title) ...
-            conn = connect_db()
-            actual_title = chat_id  # Default to chat_id if lookup fails
-            if conn:
-                try:
-                    with conn.cursor() as cur:
-                        cur.execute(
-                            "SELECT title FROM user_chats WHERE user_id = %s AND chat_id = %s;",
-                            (user_id, chat_id)
-                        )
-                        row = cur.fetchone()
-                        if row and row[0]:
-                            actual_title = row[0]
-                except Exception as title_error:
-                    print(f"[ERROR] Error fetching chat title: {title_error}")
-                finally:
-                    if conn:
-                       conn.close()
-            else: 
-                 print("[WARNING] Failed to connect to DB for title lookup")
-
-            # Extract RAGAS metrics from sources if available
-            ragas_metrics = {}
-            if RAGAS_AVAILABLE and dataset_option != "None" and retrieved_docs:
-                try:
-                    # Extract contexts from retrieved documents
-                    contexts = [doc.page_content for doc in retrieved_docs if hasattr(doc, "page_content")]
-                    
-                    # If we don't have direct context access, try to extract from sources
-                    if not contexts and sources_json:
-                        contexts = extract_contexts_from_sources(sources_json)
-                    
-                    if contexts:
-                        # Get RAGAS metrics synchronously before logging analytics
-                        results = await run_both_ragas_implementations(
-                            question=user_message,
-                            answer=cleaned_response,
-                            contexts=contexts
-                        )
-                        
-                        if results["combined_metrics"]:
-                            ragas_metrics = results["combined_metrics"]
-                            print(f"[DEBUG /api/chat] RAGAS metrics obtained for initial analytics log: {ragas_metrics}")
-                except Exception as ragas_sync_error:
-                    print(f"[ERROR /api/chat] Error getting RAGAS metrics for initial analytics: {ragas_sync_error}")
-            
-            current_timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
-            print(f"[DEBUG /api/chat] Value of user_message before AnalyticsInput: {user_message}") 
-            analytics_payload = AnalyticsInput(
-                question=user_message,
-                answer=cleaned_response,
-                feedback="auto-logged", 
-                sources=sources_json if sources_json is not None else {},
-                chat_id=chat_id,
-                rouge1=metrics.get("rouge1"),
-                rouge2=metrics.get("rouge2"),
-                rougeL=metrics.get("rougeL"),
-                bert_p=metrics.get("bert_p"),
-                bert_r=metrics.get("bert_r"),
-                bert_f1=metrics.get("bert_f1"),
-                response_time=metrics.get("elapsed_time"),
-                cosine_similarity=metrics.get("cosine_similarity"),
-                user_id=current_user.get("user_id"),
-                title=actual_title, 
-                username=current_user.get("username"),
-                office_code=current_user.get("office_code"),
-                timestamp=current_timestamp,
-                dataset=dataset_option,  
-                node_count=node_count, 
-                model=model_name,
-                # Add RAGAS metrics from our synchronous evaluation
-                faithfulness=ragas_metrics.get("faithfulness"),
-                answer_relevancy=ragas_metrics.get("answer_relevancy"),
-                context_relevancy=ragas_metrics.get("context_relevancy"),
-                context_precision=ragas_metrics.get("context_precision"),
-                context_recall=ragas_metrics.get("context_recall"),
-                harmfulness=ragas_metrics.get("harmfulness"),
-                # Add LLMEvaluator metrics from our synchronous evaluation
-                llm_evaluator_CompositeRagasScore=ragas_metrics.get("llm_evaluator_CompositeRagasScore"),
-                llm_evaluator_factual_consistency=ragas_metrics.get("llm_evaluator_factual_consistency"),
-                llm_evaluator_answer_relevance=ragas_metrics.get("llm_evaluator_answer_relevance"),
-                llm_evaluator_context_relevance=ragas_metrics.get("llm_evaluator_context_relevance"),
-                llm_evaluator_context_coverage=ragas_metrics.get("llm_evaluator_context_coverage"),
-                llm_evaluator_coherence=ragas_metrics.get("llm_evaluator_coherence"),
-                llm_evaluator_fluency=ragas_metrics.get("llm_evaluator_fluency")
-            )
-            
-            print(f"[DEBUG /api/chat] analytics_payload before logging: {analytics_payload.dict()}")
-            print(f"[DEBUG /api/chat] Value of analytics_payload.question: {analytics_payload.question}")
-            
-            print("------ CALLING log_analytics NOW ------")
-            log_analytics_called = True
-            await log_analytics(
-                analytics_payload.question,
-                analytics_payload.answer,
-                analytics_payload.feedback,
-                analytics_payload.sources,
-                analytics_payload.response_time,
-                analytics_payload.user_id,
-                analytics_payload.title,
-                analytics_payload.username,
-                analytics_payload.office_code,
-                analytics_payload.chat_id,
-                analytics_payload.rouge1,
-                analytics_payload.rouge2,
-                analytics_payload.rougeL,
-                analytics_payload.bert_p,
-                analytics_payload.bert_r,
-                analytics_payload.bert_f1,
-                analytics_payload.cosine_similarity,
-                analytics_payload.timestamp,
-                analytics_payload.dataset,
-                analytics_payload.node_count,
-                analytics_payload.model,
-                analytics_payload.faithfulness,
-                analytics_payload.answer_relevancy,
-                analytics_payload.context_relevancy,
-                analytics_payload.context_precision,
-                analytics_payload.context_recall,
-                analytics_payload.harmfulness,
-                # Add LLMEvaluator metrics to log_analytics call
-                analytics_payload.llm_evaluator_CompositeRagasScore,
-                analytics_payload.llm_evaluator_factual_consistency,
-                analytics_payload.llm_evaluator_answer_relevance,
-                analytics_payload.llm_evaluator_context_relevance,
-                analytics_payload.llm_evaluator_context_coverage,
-                analytics_payload.llm_evaluator_coherence,
-                analytics_payload.llm_evaluator_fluency
-            )
-            print("[DEBUG /api/chat] Analytics logged successfully (call returned).")
-        except Exception as e:
-            log_analytics_called = False
-            print(f"[ERROR /api/chat] Error during analytics preparation or logging call: {e}")
-            import traceback
-            traceback.print_exc()
-        finally:
-            if log_analytics_called:
-                 print("[DEBUG /api/chat] Log analytics call was attempted.")
-            else:
-                 print("[WARNING /api/chat] Log analytics call was NOT attempted due to prior error.")
-                 
-        # --- Trigger RAGAS evaluation asynchronously ---
-        try:
-            if RAGAS_AVAILABLE and dataset_option != "None" and retrieved_docs:
-                if ragas_metrics and any(ragas_metrics.values()):
-                    print("[DEBUG /api/chat] Skipping async RAGAS evaluation since metrics were already computed synchronously")
-                else:
-                    print("[DEBUG /api/chat] Triggering async RAGAS evaluation")
-                    
-                    contexts = [doc.page_content for doc in retrieved_docs if hasattr(doc, "page_content")]
-                    
-                    if not contexts and sources_json:
-                        contexts = extract_contexts_from_sources(sources_json)
-                    
-                    if contexts:
-                        async def run_ragas_evaluation():
-                            try:
-                                results = await run_both_ragas_implementations(
-                                    question=user_message,
-                                    answer=cleaned_response,
-                                    contexts=contexts
-                                )
-                                
-                                if results["combined_metrics"]:
-                                    await update_analytics_with_ragas(
-                                        user_id=user_id,
-                                        chat_id=chat_id,
-                                        question=user_message,
-                                        metrics=results["combined_metrics"]
-                                    )
-                                    print(f"[DEBUG /api/chat] RAGAS evaluation completed with both implementations")
-                                    print(f"[DEBUG /api/chat] Custom metrics: {results['custom_metrics']}")
-                                    print(f"[DEBUG /api/chat] LLMEvaluator metrics: {results['llm_evaluator_metrics']}")
-                            except Exception as ragas_error:
-                                print(f"[ERROR /api/chat] RAGAS evaluation failed: {ragas_error}")
-                        
-                        asyncio.create_task(run_ragas_evaluation())
-                        print("[DEBUG /api/chat] RAGAS evaluation task launched")
-                    else:
-                        print("[DEBUG /api/chat] Skipping RAGAS evaluation: No contexts available")
-            else:
-                print(f"[DEBUG /api/chat] Skipping RAGAS evaluation: RAGAS_AVAILABLE={RAGAS_AVAILABLE}, dataset={dataset_option}, has_docs={bool(retrieved_docs)}")
-        except Exception as ragas_init_error:
-            print(f"[ERROR /api/chat] Failed to initialize RAGAS evaluation: {ragas_init_error}")
-
-    response_headers = {"X-Chat-ID": chat_id}
-    return StreamingResponse(token_generator(), media_type="text/event-stream", headers=response_headers)
-
+    return StreamingResponse(token_generator(), media_type="text/event-stream")
 
 
 # ------------------------------------------------------------------

@@ -134,6 +134,7 @@ jobs:
   # Neo4j Database 
   neo4j:
     image: neo4j:5.11.0
+    http_auth: false
     detach: True
     env:
       NEO4J_AUTH: neo4j/password

@@ -537,489 +537,100 @@ function ChatPage() {
     }
   };
 
-  // Handle sending messages.
   const handleSendMessage = async () => {
     if (!userInput.trim()) return;
 
-    // Check for inappropriate content before sending
-    const sanitizationResult = sanitizeUserInput(userInput);
-    if (!sanitizationResult.isAppropriate) {
-      // Display warning and don't send the message
-      setMessages(prev => [...prev, { 
-        sender: 'bot', 
-        content: "I'm sorry, but your message appears to contain inappropriate content that I cannot respond to. Please revise your question."
-      }]);
-      return;
-    }
-
-    // Save the current query before clearing userInput.
     const currentUserQuery = userInput;
-
-    // Append the user's message.
     setMessages(prev => [...prev, { sender: 'user', content: currentUserQuery }]);
-    setUserInput(''); // Clear input immediately after appending user message
-    setLastInteractionData(null); // Clear previous interaction data
-    setSourceContent(''); // Clear previous sources display
-    
-    // Set generating state to true and create new abort controller
+    setUserInput('');
     setIsGenerating(true);
-    abortControllerRef.current = new AbortController();
-    const signal = abortControllerRef.current.signal;
 
-    console.log("[handleSendMessage] Current persona state:", persona); // Log persona state
     const payload = {
       message: currentUserQuery,
       model: selectedModel,
       temperature: temperature,
-      dataset: dataset,
-      persona: persona, 
-      chat_id: selectedChat
+      dataset: dataset
     };
 
-    // Add clear logging of which dataset is being used
-    console.log(`[DEBUG] Sending message with dataset: "${dataset}" to connect to table: document_embeddings_${dataset === "KG" ? "combined" : dataset.toLowerCase()}`);
-
-    const startTime = performance.now(); // Record start time
-    let botMessage = ""; // Accumulate raw bot response
-    let cleanedBotMessage = ""; // Accumulate cleaned bot response
-    let messageIndex = null; // Track the index of the bot message for source association
+    let botMessage = "";
+    let messageIndex = null;
 
     try {
-      const response = await fetch(
-        'https://docker-llm-backend--6b5efca2ab.jobs.scottdc.org.apolo.scottdata.ai/api/chat',
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': sessionToken,
-            'Accept': 'text/event-stream'
-          },
-          body: JSON.stringify(payload),
-          signal // Add the abort signal to the fetch request
-        }
-      );
-
-      if (!response.body) {
-        throw new Error("ReadableStream not supported in this browser.");
-      }
-
-      console.log("[DEBUG] Starting to read stream...");
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-
-      // Add an empty bot message placeholder to update later.
       setMessages(prev => {
-        messageIndex = prev.length; // Store the index of this message
+        messageIndex = prev.length;
         return [...prev, { sender: 'bot', content: "" }];
       });
 
-      let streamDone = false;
-      while (!streamDone) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        const buffer = decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n");
-        for (const line of lines) {
-          if (line.startsWith("data: ")) {
-            const dataStr = line.slice(6).trim();
-            if (dataStr === "[DONE]") {
-              streamDone = true;
-              break;
-            }
-            try {
-              const parsed = JSON.parse(dataStr);
-              if (parsed.token) {
-                let token = parsed.token;
-                // Accumulate raw token first
-                botMessage += token; 
-                
-                // Simplified cleaning logic (apply more robust cleaning if needed)
-                let cleanedToken = token;
-                if (token.includes("content=")) { 
-                  const parts = token.split("content=");
-                  cleanedToken = ""; // Reset for this potentially multi-part token
-                  for (const part of parts) {
-                    if (part.startsWith("'") || part.startsWith('"')) {
-                      const quoteChar = part[0];
-                      const endQuoteIndex = part.indexOf(quoteChar, 1);
-                      if (endQuoteIndex !== -1) {
-                        cleanedToken += part.substring(1, endQuoteIndex);
-                      }
-                    } else {
-                      // Append parts that don't look like content strings (might be metadata)
-                      // This part might need refinement based on actual stream format
-                    }
-                  }
-                }
-                
-                // Append the cleaned part to the display message
-                cleanedBotMessage += cleanedToken; 
-                
-                // Normalize line breaks in the message to maintain structure
-                const displayMessage = cleanedBotMessage
-                  .replace(/\\n/g, "\n")           // Convert literal '\n' to newlines
-                  .replace(/\\\\n/g, "\n")         // Handle double-escaped newlines
-                  .replace(/\r\n?/g, "\n")         // Normalize CRLF to LF
-                  .replace(/\n{3,}/g, "\n\n")      // Limit to max 2 consecutive line breaks
-                  .replace(/ {2,}/g, " ")          // Remove extra spaces
-                  .replace(/\\$/gm, "")            // Remove trailing backslashes at end of lines
-                  .replace(/\\(?!\S)/g, "");       // Remove standalone backslashes
+      const response = await fetch('https://docker-llm-backend--6b5efca2ab.jobs.scottdc.org.apolo.scottdata.ai/api/chat', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': sessionToken,
+        },
+        body: JSON.stringify(payload),
+      });
 
+      if (!response.ok) {
+        console.error("Error sending message:", response.statusText);
+        setMessages(prev => {
+          const updated = [...prev];
+          updated[messageIndex].content = `Error processing request: ${response.statusText}`;
+          return updated;
+        });
+        setIsGenerating(false);
+        return;
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let partialLine = ""; // Accumulate partial lines
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+          break;
+        }
+
+        const chunk = decoder.decode(value);
+        partialLine += chunk;
+
+        // Process complete lines
+        while (partialLine.includes('\n')) {
+          const newlineIndex = partialLine.indexOf('\n');
+          const line = partialLine.substring(0, newlineIndex).trim(); // Extract line
+          partialLine = partialLine.substring(newlineIndex + 1); // Remove line from buffer
+
+          if (line) { // Only process non-empty lines
+            try {
+              const parsed = JSON.parse(line);
+              if (parsed.token) {
+                botMessage += parsed.token;
                 setMessages(prev => {
                   const updated = [...prev];
-                  if (updated.length > 0 && updated[updated.length - 1].sender === 'bot') {
-                      updated[updated.length - 1].content = displayMessage;
-                  }
+                  updated[messageIndex].content = botMessage;
                   return updated;
                 });
               }
-            } catch (err) {
-              console.error("Error parsing token JSON:", err, dataStr);
+            } catch (error) {
+              console.error("Error parsing line:", error, line);
             }
           }
         }
       }
-      console.log("[DEBUG] Final bot message (cleaned):", cleanedBotMessage);
-      
-      const endTime = performance.now(); // Record end time
-      const elapsedTime = (endTime - startTime) / 1000; // Elapsed time in seconds
 
-      // --- Fetch sources AFTER stream is done --- 
-      let fetchedSources = []; // Default to empty array
-      let sourcesMarkdown = '';
-      if (dataset !== "None") { // Only fetch sources if dataset is not None
-        fetchedSources = await fetchSources(currentUserQuery, dataset);
-        sourcesMarkdown = sourceContent; // Capture the current sources markdown
-        console.log("Sources markdown captured:", sourcesMarkdown);
-        
-        // CRITICAL FIX: Directly update the message with sources, don't rely on later updates
-        if (messageIndex !== null && sourcesMarkdown) {
-          // Parse sources from the markdown for immediate use
-          const parsedSources = parseSourcesMarkdown(sourcesMarkdown);
-          console.log("Parsed sources for immediate attachment:", parsedSources);
-          
-          // Force flag to always show sources if we have them
-          const hasSources = parsedSources.length > 0;
-          console.log("Setting hasSources =", hasSources, "for message", messageIndex);
-          
-          setMessages(prev => {
-            const updated = [...prev];
-            if (updated[messageIndex]) {
-              updated[messageIndex] = {
-                ...updated[messageIndex],
-                hasSources: hasSources,
-                sourcesMarkdown: sourcesMarkdown,
-                sources: parsedSources // Add the parsed sources directly
-              };
-            }
-            return updated;
-          });
-          
-          // Immediately make sources expandable if we have any
-          if (hasSources) {
-            setExpandedMessageSources(prev => ({
-              ...prev,
-              [messageIndex]: false // Default to collapsed for new messages with sources
-            }));
-          }
-          
-          // Update sourcesByQuestion immediately
-          const questionNumber = messageIndex > 0 ? 
-            prev => prev.filter(msg => msg.sender === 'user').length : 
-            1; // Fallback to 1 if we can't count
-          
-          setSourcesByQuestion(prev => {
-            const updated = { ...prev };
-            if (!updated[questionNumber]) {
-              updated[questionNumber] = [];
-            }
-            
-            // Add sources, avoiding duplicates
-            const currentTitles = new Set(updated[questionNumber].map(s => s.title));
-            parsedSources.forEach(source => {
-              if (!currentTitles.has(source.title)) {
-                updated[questionNumber].push(source);
-              }
-            });
-            
-            return updated;
-          });
-          
-          // Also update allUniqueSources
-          setAllUniqueSources(prevSources => {
-            // Create a new Set with all current sources
-            const currentSourceTitles = new Set(prevSources.map(source => source.title));
-            
-            // Filter out sources we already have
-            const newSources = parsedSources.filter(source => !currentSourceTitles.has(source.title));
-            
-            // Return updated array with new unique sources added
-            const updatedSources = [...prevSources, ...newSources];
-            console.log("All unique sources after update:", updatedSources);
-            return updatedSources;
-          });
-          
-          // EXPLICITLY force the sources button to update by recalculating total
-          // This is key to fixing the bug where the count doesn't update
-          setTimeout(() => {
-            const updatedTotal = calculateTotalSources();
-            console.log("SOURCES COUNT UPDATE: Button should now show", updatedTotal, "sources");
-            
-            // Force a UI refresh to ensure the sources button updates
-            setOpenSnackbar(prevState => {
-              setTimeout(() => setOpenSnackbar(false), 100);
-              return true;
-            });
-          }, 200);
-        }
-      } else {
-        setSourceContent(''); // Ensure sources are cleared if dataset is None
-      }
-
-      // --- Assemble interaction data for feedback --- 
-      const interactionData = {
-          question: currentUserQuery,
-          answer: cleanedBotMessage,
-          sources: fetchedSources,
-          sourcesMarkdown: sourcesMarkdown,
-          model: selectedModel,
-          temperature: temperature,
-          dataset: dataset,
-          personality: persona,
-          chat_id: selectedChat,
-          elapsed_time: elapsedTime,
-          messageIndex: messageIndex
-      };
-      // Force ensure lastInteractionData is set (change setLastInteractionData to this):
-      console.log("Setting lastInteractionData for feedback buttons");
-      setLastInteractionData(interactionData);
-
-      // FORCE REFRESH: Reload the current chat to ensure everything is displayed properly
-      console.log("Forcing refresh of chat data...");
-      if (selectedChat) {
-        // We need to reload the full chat with fresh data
-        await loadChatMessages(selectedChat);
-        
-        // Force refresh of the All Sources dropdown using the latest message with sources
-        const latestBot = messages.filter(msg => msg.sender === 'bot').pop();
-        if (latestBot && (latestBot.sources || latestBot.sourcesMarkdown)) {
-          const parsedSources = latestBot.sources || 
-                                (latestBot.sourcesMarkdown ? 
-                                parseSourcesMarkdown(latestBot.sourcesMarkdown) : 
-                                []);
-          
-          if (parsedSources.length > 0) {
-            // Update sourcesByQuestion with the latest sources
-            const questionNumber = messages.filter(msg => msg.sender === 'user').length;
-            setSourcesByQuestion(prev => {
-              const updated = { ...prev };
-              if (!updated[questionNumber]) {
-                updated[questionNumber] = [];
-              }
-              
-              // Add the new sources, avoiding duplicates
-              const currentTitles = new Set(updated[questionNumber].map(s => s.title));
-              parsedSources.forEach(source => {
-                if (!currentTitles.has(source.title)) {
-                  updated[questionNumber].push(source);
-                }
-              });
-              
-              return updated;
-            });
-            
-            // Update allUniqueSources for completeness
-            setAllUniqueSources(prevSources => {
-              const currentSourceTitles = new Set(prevSources.map(source => source.title));
-              const newSources = parsedSources.filter(source => !currentSourceTitles.has(source.title));
-              return [...prevSources, ...newSources];
-            });
-          }
-        }
-        
-        // Also force refresh of the sources count
-        const newTotalSources = calculateTotalSources();
-        console.log("Updated sources count:", newTotalSources);
-      }
+      setIsGenerating(false); // Mark generation as complete after stream ends
 
     } catch (error) {
-      // Check if this is an abort error
-      if (error.name === 'AbortError') {
-        console.log('LLM generation was aborted');
-        
-        // Remove the bot's message entirely when generation is stopped
-        setMessages(prev => {
-          // Remove the last message if it's from the bot
-          if (prev.length > 0 && prev[prev.length - 1].sender === 'bot') {
-            return prev.slice(0, -1);
-          }
-          return prev;
-        });
-        
-        // Clear any cached data to ensure nothing is saved
-        messageIndex = null;
-      } else {
-        console.error("Error sending message:", error);
-        setMessages(prev => {
-          const updated = [...prev];
-          if (updated.length > 0 && updated[updated.length - 1].sender === 'bot') {
-            updated[updated.length - 1].content = "Error processing request.";
-          }
-          return updated;
-        });
-      }
-      setLastInteractionData(null); // Clear data on error
-    } finally {
-      // Always set generating to false when done
+      console.error("Error sending message:", error);
+      setMessages(prev => {
+        const updated = [...prev];
+        updated[messageIndex].content = "Error processing request.";
+        return updated;
+      });
       setIsGenerating(false);
-      abortControllerRef.current = null;
-      
-      // Scroll to bottom
-      setTimeout(scrollToBottom, 100);
-      
-      // AGGRESSIVE APPROACH: Force refresh everything with a short delay
-      setTimeout(() => {
-        console.log("FORCE REFRESH: Updating sources after small delay");
-        
-        // Force recalculation of total sources directly
-        const userMsgs = messages.filter(msg => msg.sender === 'user').length;
-        console.log(`Total user messages: ${userMsgs}`);
-        
-        // Force update of sources by question
-        const sourcesFromMessages = [];
-        const tempSourcesByQuestion = {...sourcesByQuestion};
-        
-        // Scan through all messages to collect sources
-        messages.forEach((msg, idx) => {
-          if (msg.sender === 'bot' && (msg.hasSources || msg.sourcesMarkdown || (msg.sources && msg.sources.length > 0))) {
-            // Find the corresponding user message index
-            const prevUserMsgs = messages.slice(0, idx).filter(m => m.sender === 'user').length;
-            const questionNum = prevUserMsgs;
-            
-            const sources = msg.sources || 
-                           (msg.sourcesMarkdown ? parseSourcesMarkdown(msg.sourcesMarkdown) : []);
-            
-            if (sources.length > 0) {
-              // Ensure this question has an entry
-              if (!tempSourcesByQuestion[questionNum]) {
-                tempSourcesByQuestion[questionNum] = [];
-              }
-              
-              // Add each source, avoiding duplicates
-              sources.forEach(source => {
-                const existingSource = tempSourcesByQuestion[questionNum].find(s => s.title === source.title);
-                if (!existingSource) {
-                  tempSourcesByQuestion[questionNum].push(source);
-                  allMessageSources.push(source);
-                }
-              });
-            }
-          }
-        });
-        
-        // Force refresh of sourcesByQuestion and allUniqueSources
-        setSourcesByQuestion({...tempSourcesByQuestion});
-        
-        // Combine all sources into allUniqueSources
-        const uniqueTitles = new Set();
-        const uniqueSources = [];
-        sourcesFromMessages.forEach(source => {
-          if (!uniqueTitles.has(source.title)) {
-            uniqueTitles.add(source.title);
-            uniqueSources.push(source);
-          }
-        });
-        
-        if (uniqueSources.length > 0) {
-          setAllUniqueSources(uniqueSources);
-        }
-        
-        // Force update the sources count
-        const total = calculateTotalSources();
-        setSourcesCount(total);
-        
-        // Force the sources dropdown to update if it's open
-        if (showSourcesDropdown) {
-          setShowSourcesDropdown(false);
-          setTimeout(() => setShowSourcesDropdown(true), 50);
-        }
-        
-        // Force a UI refresh by updating the forceUpdate state
-        setForceUpdate(prev => prev + 1);
-        
-        // Force re-render by updating a dummy state if needed
-        setOpenSnackbar(prev => {
-          setTimeout(() => setOpenSnackbar(false), 100);
-          return true;
-        });
-      }, 500);
-      
-      // Also ensure feedback buttons are enabled by restoring lastInteractionData if needed
-      if (!lastInteractionData) {
-        const lastBotMsg = messages.filter(msg => msg.sender === 'bot').pop();
-        const lastUserMsg = messages.filter(msg => msg.sender === 'user').pop();
-        
-        if (lastBotMsg && lastUserMsg) {
-          const forcedInteractionData = {
-            question: lastUserMsg.content,
-            answer: lastBotMsg.content,
-            sources: lastBotMsg.sources || [],
-            sourcesMarkdown: lastBotMsg.sourcesMarkdown || '',
-            model: selectedModel,
-            temperature: temperature,
-            dataset: dataset,
-            personality: persona,
-            chat_id: selectedChat,
-            elapsed_time: 0, // Default since we don't have the real value
-            messageIndex: messages.indexOf(lastBotMsg)
-          };
-          
-          console.log("FORCE ENABLING FEEDBACK BUTTONS");
-          setLastInteractionData(forcedInteractionData);
-        }
-      }
     }
   };
 
-  // Function to sanitize user input and check for inappropriate content
-  const sanitizeUserInput = (input) => {
-    // Convert to lowercase for easier matching
-    const lowerCaseInput = input.toLowerCase();
-    
-    // Define patterns for inappropriate content
-    const inappropriatePatterns = [
-      // Profanity and offensive language
-      /\b(f[u\*]+ck|sh[i\*]+t|b[i\*]+tch|c[u\*]+nt|a[s\*]+hole|d[i\*]+ck|p[u\*]+ssy|porn|xxx)\b/,
-      
-      // Harmful instructions
-      /\b(how to (make|create|build) (bomb|explosive|weapon|virus|malware))\b/,
-      
-      // Requests for illegal content
-      /\b(illegal (drugs|content)|child (porn|abuse)|underage)\b/,
-      
-      // Hate speech indicators
-      /\b(kill|murder|attack|bomb|shoot|harm|hurt) (people|group|community|race|religion)\b/,
-      
-      // Add more patterns as needed
-    ];
-    
-    // Check if any inappropriate pattern matches
-    for (const pattern of inappropriatePatterns) {
-      if (pattern.test(lowerCaseInput)) {
-        console.log("Inappropriate content detected:", pattern);
-        return {
-          isAppropriate: false,
-          reason: "Contains inappropriate or harmful content"
-        };
-      }
-    }
-    
-    // If no inappropriate patterns matched, the input is considered appropriate
-    return {
-      isAppropriate: true,
-      sanitizedInput: input.trim()
-    };
-  };
 
   // *** ADDED: Function to handle Enter key press ***
   const handleKeyDown = (event) => {
