@@ -11,11 +11,11 @@ import aiofiles
 import numpy as np
 from pydantic import BaseModel
 from typing import List, Any, Dict
+from typing import Optional
 from sklearn.metrics.pairwise import cosine_similarity
 from pathlib import Path
 from prompts import promptDict 
 from datetime import datetime
-from typing import Optional
 from urllib.parse import quote
 import csv
 import contextvars
@@ -23,6 +23,184 @@ import psycopg2
 from bcrypt import hashpw, gensalt
 import subprocess
 import sys
+import threading
+from psycopg2 import pool
+import logging
+import hashlib
+import jwt
+from collections import deque
+import time as time_module  # Import time module for connection age tracking
+
+# -----------------------------------
+# PostgreSQL Connection Pool Setup
+# -----------------------------------
+# Global connection pool - keeps connections alive for the application lifetime
+_connection_pool: Optional[psycopg2.pool.ThreadedConnectionPool] = None
+_pool_lock = threading.Lock()
+
+# Global computation queue - processes one at a time, never blocks streaming
+computation_queue = None  # Will be initialized as asyncio.Queue() 
+computation_worker_started = False
+computation_status = {}  # Track status by computation_id
+
+# Track connection creation times to proactively refresh before 5-minute timeout
+connection_creation_times = {}
+connection_age_lock = threading.Lock()
+
+def get_connection_pool():
+    """Get or create the global connection pool with idle connection handling."""
+    global _connection_pool
+    if _connection_pool is None:
+        with _pool_lock:
+            if _connection_pool is None:
+                host = os.environ.get("DB_HOST", "127.0.0.1")
+                port = os.environ.get("DB_PORT", 5432)
+                user = os.environ.get("DB_USER", "postgres")
+                password = os.environ.get("DB_PASSWORD", "admin")
+                database = os.environ.get("DB_NAME", "postgres")
+                
+                print("[DEBUG] Creating PostgreSQL connection pool for persistent connections...")
+                try:
+                    _connection_pool = psycopg2.pool.ThreadedConnectionPool(
+                        minconn=5,  # Minimum persistent connections
+                        maxconn=20,  # Maximum concurrent connections
+                        host=host,
+                        port=port,
+                        user=user,
+                        password=password,
+                        database=database,
+                        sslmode='require',
+                        # Add connection parameters to handle idle timeouts
+                        connect_timeout=10,          # Connection timeout
+                        application_name='FastAPI_App',  # For monitoring
+                        options='-c statement_timeout=300000',  # 5 minute statement timeout
+                        # TCP keepalive settings to prevent 5-minute timeouts
+                        keepalives_idle=60,          # Start keepalives after 1 minute idle
+                        keepalives_interval=30,      # Send keepalive every 30 seconds  
+                        keepalives_count=3,          # 3 failed keepalives = connection dead
+                    )
+                    print(f"[DEBUG] ✓ PostgreSQL connection pool created successfully (5-20 persistent connections)")
+                    print(f"[DEBUG] ✓ Connected to {host}:{port}/{database} as {user}")
+                    print(f"[DEBUG] ✓ Idle connection handling enabled")
+                except Exception as e:
+                    print(f"[ERROR] ✗ Failed to create connection pool: {e}")
+                    _connection_pool = None
+    return _connection_pool
+
+def validate_connection(conn):
+    """
+    Validate that a connection is still alive and responsive.
+    Returns True if healthy, False if stale/dead.
+    """
+    if not conn or conn.closed:
+        return False
+        
+    try:
+        # Quick test query with short timeout
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1")
+        result = cursor.fetchone()
+        cursor.close()
+        return result and result[0] == 1
+    except Exception:
+        return False
+
+def track_connection_age(conn):
+    """Track when a connection was created/validated to proactively refresh before timeout."""
+    if conn:
+        conn_id = id(conn)
+        with connection_age_lock:
+            if conn_id not in connection_creation_times:
+                print(f"[DEBUG] 🆕 Tracking new connection age: {conn_id}")
+            connection_creation_times[conn_id] = time_module.time()
+
+def is_connection_approaching_timeout(conn, timeout_threshold=240):  # 4 minutes = 240 seconds
+    """Check if connection is approaching the 5-minute timeout threshold."""
+    if not conn:
+        return True
+        
+    conn_id = id(conn)
+    with connection_age_lock:
+        creation_time = connection_creation_times.get(conn_id)
+        if creation_time:
+            age = time_module.time() - creation_time
+            return age > timeout_threshold
+        return False  # Unknown age = assume it's new and fresh, not old
+
+def get_db_connection():
+    """Get a persistent connection from the pool with proactive timeout prevention."""
+    pool = get_connection_pool()
+    if pool:
+        max_retries = 5  # Increased retries for 5-minute timeout issue
+        for attempt in range(max_retries):
+            try:
+                conn = pool.getconn()
+                if conn:
+                    # CRITICAL: Check if connection is approaching 5-minute timeout
+                    if is_connection_approaching_timeout(conn):
+                        print(f"[DEBUG] 🔄 Connection approaching 5-min timeout, refreshing (attempt {attempt + 1})")
+                        pool.putconn(conn, close=True)  # Close old connection
+                        continue
+                    
+                    # CRITICAL: Validate connection before every use (prevents 5-min timeout)
+                    if validate_connection(conn):
+                        track_connection_age(conn)  # Track this healthy connection
+                        print(f"[DEBUG] ✅ Connection validated successfully (attempt {attempt + 1})")
+                        return conn  # Connection is healthy
+                    else:
+                        print(f"[DEBUG] ❌ Connection validation failed, removing from pool (attempt {attempt + 1})")
+                        pool.putconn(conn, close=True)
+                        continue
+                        
+            except Exception as e:
+                print(f"[ERROR] Failed to get connection from pool (attempt {attempt + 1}): {e}")
+                if attempt == max_retries - 1:
+                    # Last attempt failed, try to recreate the pool
+                    print("[DEBUG] All connection attempts failed, recreating connection pool...")
+                    global _connection_pool
+                    with _pool_lock:
+                        if _connection_pool:
+                            try:
+                                _connection_pool.closeall()
+                            except:
+                                pass
+                            _connection_pool = None
+                    # Clear connection age tracking
+                    with connection_age_lock:
+                        connection_creation_times.clear()
+                    # Recursive call to recreate pool
+                    return get_db_connection()
+                continue
+                
+        print("[ERROR] Failed to get valid connection after all retries")
+        return None
+    return None
+
+def return_db_connection(conn):
+    """Return a connection to the pool for reuse - keeps connection alive."""
+    pool = get_connection_pool()
+    if pool and conn:
+        try:
+            # Only return healthy connections to pool
+            if not conn.closed:
+                pool.putconn(conn)  # Connection stays alive for reuse
+            else:
+                pool.putconn(conn, close=True)  # Close dead connections
+        except Exception as e:
+            print(f"[ERROR] Failed to return connection to pool: {e}")
+
+def close_connection_pool():
+    """Close all connections in the pool when application shuts down."""
+    global _connection_pool
+    if _connection_pool:
+        print("[DEBUG] Closing PostgreSQL connection pool...")
+        _connection_pool.closeall()
+        _connection_pool = None
+        print("[DEBUG] ✓ All database connections closed")
+
+# Initialize the connection pool at startup
+print("\n=== Initializing Database Connection Pool ===")
+get_connection_pool()
 
 # -----------------------------------
 # Set up RAGAS with Local Ollama at startup
@@ -120,12 +298,105 @@ ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_HOURS = 24  # token valid for 24 hours
 OLLAMA_API_URL = "http://localhost:11434/api/chat"
 ALLOWED_ROOT = Path("/home/cm36/Updated-LLM-Project/J1_corpus/cleaned")
-AVAILABLE_MODELS = ["mistral:latest", "sskostyaev/mistral:7b-instruct-v0.2-q6_K-32k", "mistral:7b-instruct-v0.3-q3_K_M"]
+AVAILABLE_MODELS = ["mistral:latest", "sskostyaev/mistral:7b-instruct-v0.2-q6_K-32k", "mistral:7b-instruct-v0.3-q3_K_M", "mistral-STRATGPT:latest"]
 SIMILARITY_THRESHOLD = 0.3
 # ------------------------------------------------------------------
 # App Setup and CORS Configuration
 # ------------------------------------------------------------------
 app = FastAPI()
+
+# Shutdown event handler to properly close database connections
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Close database connection pool when application shuts down."""
+    print("\n=== Application Shutdown - Cleaning up resources ===")
+    close_connection_pool()
+    print("=== Cleanup complete ===")
+
+# Startup event handler to initialize computation queue
+@app.on_event("startup")
+async def startup_event():
+    """Initialize computation queue and start background worker"""
+    global computation_queue, computation_worker_started
+    
+    print("\n=== Initializing Background Computation System ===")
+    computation_queue = asyncio.Queue()
+    
+    if not computation_worker_started:
+        asyncio.create_task(process_computation_queue())
+        computation_worker_started = True
+        print("[DEBUG] ✅ Background computation queue worker started")
+        print("[DEBUG] 🚀 Streaming responses will NEVER be blocked by computations")
+    
+    # Start connection pool maintenance task
+    asyncio.create_task(maintain_connection_pool())
+    print("[DEBUG] ✅ Connection pool maintenance task started")
+    
+    print("=== Background computation system ready ===")
+
+async def maintain_connection_pool():
+    """
+    Background task to maintain connection pool health during idle periods.
+    Prevents connections from becoming stale by periodically testing them.
+    Runs every 2 minutes to prevent 5-minute server timeouts.
+    Now includes Neo4j connection maintenance.
+    """
+    print("[DEBUG] 🔄 Connection pool maintenance started - PostgreSQL + Neo4j keep-alive")
+    
+    while True:
+        try:
+            # Wait 2 minutes between maintenance cycles (more frequent than 5-min timeout)
+            await asyncio.sleep(120)  # 2 minutes
+            
+            print("[DEBUG] 🔄 Running connection maintenance (PostgreSQL + Neo4j)...")
+            
+            # PostgreSQL maintenance (existing logic)
+            print("[DEBUG] 🔄 PostgreSQL maintenance...")
+            connections_tested = 0
+            healthy_connections = 0
+            
+            for i in range(3):  # Test up to 3 connections
+                conn = get_db_connection()
+                if conn:
+                    connections_tested += 1
+                    try:
+                        cursor = conn.cursor()
+                        cursor.execute("SELECT NOW() as keepalive_time, pg_backend_pid() as backend_pid")
+                        result = cursor.fetchone()
+                        cursor.close()
+                        return_db_connection(conn)
+                        healthy_connections += 1
+                        print(f"[DEBUG] ✅ PostgreSQL connection {i+1} keepalive successful at {result[0]} (PID: {result[1]})")
+                    except Exception as e:
+                        print(f"[DEBUG] ⚠️ PostgreSQL connection {i+1} maintenance detected stale connection: {e}")
+                        # Connection will be cleaned up by get_db_connection's error handling
+                else:
+                    print(f"[DEBUG] ⚠️ Could not get PostgreSQL connection {i+1} for maintenance")
+                    
+            print(f"[DEBUG] 🔄 PostgreSQL maintenance complete: {healthy_connections}/{connections_tested} connections healthy")
+            
+            # NEW: Neo4j maintenance
+            print("[DEBUG] 🔄 Neo4j maintenance...")
+            try:
+                # Test Neo4j connection in a thread to avoid blocking async loop
+                neo4j_healthy = await asyncio.to_thread(graph_db.validate_neo4j_connection)
+                if neo4j_healthy:
+                    print("[DEBUG] ✅ Neo4j connection healthy")
+                else:
+                    print("[DEBUG] ⚠️ Neo4j connection stale, refreshing...")
+                    await asyncio.to_thread(graph_db.refresh_neo4j_connection)
+                    # Test again after refresh
+                    neo4j_healthy_after_refresh = await asyncio.to_thread(graph_db.validate_neo4j_connection)
+                    if neo4j_healthy_after_refresh:
+                        print("[DEBUG] ✅ Neo4j connection restored after refresh")
+                    else:
+                        print("[DEBUG] ❌ Neo4j connection still failed after refresh")
+            except Exception as e:
+                print(f"[DEBUG] ⚠️ Neo4j maintenance error: {e}")
+                
+        except Exception as e:
+            print(f"[ERROR] Connection pool maintenance error: {e}")
+            # Continue the maintenance loop even if there's an error
 
 # Note: We're skipping the RAGAS router and using our fallback endpoint instead
 
@@ -1284,9 +1555,8 @@ class PGVectorRetriever:
         self.db_connection = db_connection
         
     def connect_db(self):
-        if self.db_connection is None or self.db_connection.closed:
-            self.db_connection = connect_db()
-        return self.db_connection
+        # Use connection pooling instead of individual connections
+        return get_db_connection()
     
     def as_retriever(self, search_kwargs=None):
         if search_kwargs is None:
@@ -1304,63 +1574,90 @@ class PGVectorRetriever:
         
         print(f"[DEBUG] PGVectorRetriever: Querying PostgreSQL table '{self.table_name}' for similar documents")
         
-        # Connect to the database
-        conn = self.connect_db()
-        if conn is None:
-            print("Database connection failed in PGVectorRetriever")
-            return []
-        
-        try:
-            cursor = conn.cursor()
-            # Query the database for similar embeddings
-            cursor.execute(f"""
-                SELECT id, content, embedding <-> %s::vector AS distance, 
-                       document_title, hash_document, type, category, pdf_path,
-                       chapter_title, section_title, section_number, subsection_title
-                FROM {self.table_name}
-                ORDER BY distance
-                LIMIT %s
-            """, (json.dumps(query_embedding), self.search_kwargs.get("k", 50)))
+        max_retries = 3
+        for attempt in range(max_retries):
+            # Get connection from pool with retry logic
+            conn = self.connect_db()
+            if conn is None:
+                print(f"Database connection failed in PGVectorRetriever (attempt {attempt + 1})")
+                if attempt == max_retries - 1:
+                    return []
+                continue
             
-            results = cursor.fetchall()
-            print(f"[DEBUG] PGVectorRetriever: Retrieved {len(results)} documents from '{self.table_name}'")
+            try:
+                cursor = conn.cursor()
+                # Query the database for similar embeddings
+                cursor.execute(f"""
+                    SELECT id, content, embedding <-> %s::vector AS distance, 
+                           document_title, hash_document, type, category, pdf_path,
+                           chapter_title, section_title, section_number, subsection_title
+                    FROM {self.table_name}
+                    ORDER BY distance
+                    LIMIT %s
+                """, (json.dumps(query_embedding), self.search_kwargs.get("k", 50)))
+                
+                results = cursor.fetchall()
+                print(f"[DEBUG] PGVectorRetriever: Retrieved {len(results)} documents from '{self.table_name}'")
+                
+                # Convert the results to Document objects
+                documents = []
+                for row in results:
+                    doc_id, content, distance, doc_title, hash_doc, doc_type, category, pdf_path, chapter_title, section_title, section_number, subsection_title = row
+                    
+                    # Create metadata dictionary
+                    metadata = {
+                        "id": doc_id,
+                        "distance": distance,
+                        "document_title": doc_title,
+                        "hash_document": hash_doc,
+                        "type": doc_type,
+                        "category": category,
+                        "pdf_path": pdf_path,
+                        "chapter_title": chapter_title,
+                        "section_title": section_title,
+                        "section_number": section_number,
+                        "subsection_title": subsection_title
+                    }
+                    
+                    # Filter out None values
+                    metadata = {k: v for k, v in metadata.items() if v is not None}
+                    
+                    # Create a Document object
+                    from langchain.schema import Document
+                    document = Document(page_content=content, metadata=metadata)
+                    documents.append(document)
+                
+                return documents
             
-            # Convert the results to Document objects
-            documents = []
-            for row in results:
-                doc_id, content, distance, doc_title, hash_doc, doc_type, category, pdf_path, chapter_title, section_title, section_number, subsection_title = row
+            except (psycopg2.OperationalError, psycopg2.InterfaceError) as db_error:
+                print(f"[ERROR] Database connection error in PGVectorRetriever (attempt {attempt + 1}): {db_error}")
+                # Return connection as failed so it gets removed from pool
+                if conn:
+                    try:
+                        return_db_connection(conn)
+                    except:
+                        pass
                 
-                # Create metadata dictionary
-                metadata = {
-                    "id": doc_id,
-                    "distance": distance,
-                    "document_title": doc_title,
-                    "hash_document": hash_doc,
-                    "type": doc_type,
-                    "category": category,
-                    "pdf_path": pdf_path,
-                    "chapter_title": chapter_title,
-                    "section_title": section_title,
-                    "section_number": section_number,
-                    "subsection_title": subsection_title
-                }
+                if attempt == max_retries - 1:
+                    print(f"[ERROR] All database retry attempts failed for PGVectorRetriever")
+                    return []
+                    
+                # Wait a bit before retrying
+                import time
+                time.sleep(1)
+                continue
                 
-                # Filter out None values
-                metadata = {k: v for k, v in metadata.items() if v is not None}
+            except Exception as e:
+                print(f"Error in PGVectorRetriever (attempt {attempt + 1}): {e}")
+                if attempt == max_retries - 1:
+                    return []
+                continue
                 
-                # Create a Document object
-                from langchain.schema import Document
-                document = Document(page_content=content, metadata=metadata)
-                documents.append(document)
-            
-            return documents
-        
-        except Exception as e:
-            print(f"Error in PGVectorRetriever: {e}")
-            return []
-        finally:
-            if conn:
-                conn.close()
+            finally:
+                if conn:
+                    return_db_connection(conn)  # Return to pool instead of closing
+                    
+        return []  # All attempts failed
 
 # Comment out ChromaDB retriever for reference
 # custom_retriever = Chroma(
@@ -1875,12 +2172,22 @@ async def chat_stream(request: Request, current_user: dict = Depends(get_current
     model_name = data.get("model", AVAILABLE_MODELS[0])
     temperature = float(data.get("temperature", 1.0))
     dataset_option = data.get("dataset", "KG")
-    raw_persona = data.get("persona")
-    print(f"[DEBUG /api/chat] Raw 'persona' from request  {raw_persona}")
-    personality = raw_persona if raw_persona is not None else "None"
-    print(f"[DEBUG /api/chat] Effective 'personality' after default: {personality}")
-    print(f"[DEBUG /api/chat] Value of 'personality' BEFORE calling load_personality: {personality}")
-    prompt_prefix = load_personality(personality)
+    
+    # *** TIE PROMPT TO DATASET SELECTION INSTEAD OF PERSONA ***
+    print(f"[DEBUG /api/chat] Dataset selected: '{dataset_option}'")
+    
+    # Map dataset to appropriate prompt
+    dataset_to_prompt_mapping = {
+        "None": "None",
+        "KG": "Assistant",  # General assistant for knowledge graph
+        "Air Force": "Air Force",
+        "GS": "General Schedule GS"
+    }
+    
+    prompt_personality = dataset_to_prompt_mapping.get(dataset_option, "Assistant")
+    print(f"[DEBUG /api/chat] Mapped dataset '{dataset_option}' to prompt personality: '{prompt_personality}'")
+    print(f"[DEBUG /api/chat] Loading prompt for personality: '{prompt_personality}'")
+    prompt_prefix = load_personality(prompt_personality)
     print(f"[DEBUG /api/chat] Result from load_personality (prefix length): {len(prompt_prefix)}")
     
     user_id = current_user.get("user_id")
@@ -1927,9 +2234,10 @@ async def chat_stream(request: Request, current_user: dict = Depends(get_current
     retrieved_docs = []
     context = ""
     node_count = None
-    try:
-        print(f"[DEBUG] Dataset option: {dataset_option}")
-        print(f"[DEBUG] User query: {user_message}")
+    
+    # Add timeout wrapper for chat retrieval
+    async def chat_retrieval_with_timeout():
+        nonlocal retrieved_docs, context, node_count
         loop = asyncio.get_event_loop()
 
         if dataset_option == "None":
@@ -1962,10 +2270,6 @@ async def chat_stream(request: Request, current_user: dict = Depends(get_current
                     re_rank_top=5
                 )
             print(f"[DEBUG] Retrieved {node_count} nodes (hashes) from the knowledge graph (AirForce).")
-            print("[DEBUG] Top 5 reranked AirForce documents passed to the LLM:")
-            for idx, doc in enumerate(retrieved_docs, 1):
-                snippet = doc.page_content[:200].replace("\n", " ")
-                print(f"Document {idx}: {snippet}...")
         elif dataset_option == "GS":
             print(f"[DEBUG] Using dataset: 'GS' with Neo4j and PostgreSQL table: 'document_embeddings_gs'")
             context, retrieved_docs, node_count = await async_cypher_retriever(
@@ -1977,10 +2281,6 @@ async def chat_stream(request: Request, current_user: dict = Depends(get_current
                     re_rank_top=5
                 )
             print(f"[DEBUG] Retrieved {node_count} nodes (hashes) from the knowledge graph (GS).")
-            print("[DEBUG] Top 5 reranked GS documents passed to the LLM:")
-            for idx, doc in enumerate(retrieved_docs, 1):
-                snippet = doc.page_content[:200].replace("\n", " ")
-                print(f"Document {idx}: {snippet}...")
         else:
             print(f"[DEBUG] Using fallback dataset option: '{dataset_option}' - defaulting to PostgreSQL table: 'document_embeddings_combined' without Neo4j")
             node_count = 0
@@ -1993,23 +2293,26 @@ async def chat_stream(request: Request, current_user: dict = Depends(get_current
             if raw_docs:
                  scored_results = await async_rerank_documents(user_message, raw_docs)
                  retrieved_docs = [doc for score, doc in scored_results[:5]]
-                 context = "\n\n".join([doc.page_content for doc in retrieved_docs])
                  print(f"[DEBUG] Selected top {len(retrieved_docs)} documents after reranking.")
-                 if retrieved_docs:
-                     first_snippet = retrieved_docs[0].page_content[:200].replace("\n", " ")
-                     print(f"[DEBUG] First combined doc snippet: {first_snippet}...")
-                 else:
-                     print("[DEBUG] No documents selected after reranking.")
             else:
                 print("[DEBUG] No documents retrieved from combined retriever.")
                 retrieved_docs = []
-                context = ""
                 
-    except Exception as e:
-        print(f"[ERROR] Exception in document retrieval: {e}")
-        node_count = None
-        context = ""
+            # Build simple context for non-KG datasets
+            context = "\n\n".join([doc.page_content for doc in retrieved_docs])
+    
+    try:
+        print(f"[DEBUG] Dataset option: {dataset_option}")
+        print(f"[DEBUG] User query: {user_message}")
+        
+        # Execute retrieval with timeout
+        await asyncio.wait_for(chat_retrieval_with_timeout(), timeout=6000)  # 60 second timeout
+        
+    except asyncio.TimeoutError:
+        print(f"[ERROR /api/chat] Retrieval timeout after 60 seconds - proceeding without context")
         retrieved_docs = []
+        context = ""
+        node_count = 0
 
     combined_context = f"{chat_history_context}\n\n{context.strip()}".strip()
     print(f"[DEBUG] Final combined context (first 500 chars): {combined_context[:500]}")
@@ -2020,7 +2323,7 @@ async def chat_stream(request: Request, current_user: dict = Depends(get_current
         final_prompt = f"User Query:\n{user_message}"
         
     if prompt_prefix:
-        print(f"[DEBUG] Adding prompt for personality: {personality}")
+        print(f"[DEBUG] Adding prompt for dataset '{dataset_option}' using personality: {prompt_personality}")
         print(f"[DEBUG] Prompt before adding personality: {final_prompt[:100]}...")
         final_prompt = f"{prompt_prefix}\n\n{final_prompt}"
         print(f"[DEBUG] Prompt after adding personality (first 300 chars):\n{final_prompt[:300]}")
@@ -2031,10 +2334,10 @@ async def chat_stream(request: Request, current_user: dict = Depends(get_current
         if "If \"None\" dataset is selected" in prompt_prefix:
             print(f"[DEBUG] Dataset-specific instructions included in prompt")
         
-        if personality != "None" and f"You are a {personality.lower()}" in prompt_prefix:
-            print(f"[DEBUG] Role-specific instructions for '{personality}' included in prompt")
+        if prompt_personality != "None" and f"You are a {prompt_personality.lower()}" in prompt_prefix:
+            print(f"[DEBUG] Role-specific instructions for '{prompt_personality}' included in prompt")
     else:
-        print(f"[DEBUG] Warning: No prompt_prefix loaded!")
+        print(f"[DEBUG] Warning: No prompt_prefix loaded for dataset '{dataset_option}'!")
 
     print(f"[DEBUG] Final prompt sent to LLM (first 500 chars):\n{final_prompt[:500]}")
 
@@ -2070,32 +2373,60 @@ async def chat_stream(request: Request, current_user: dict = Depends(get_current
                             print("[DEBUG /api/chat] ✅ Stream finished - now sending sources immediately")
                             
                             # *** CREATE AND SEND SOURCES IMMEDIATELY ***
+                            sources_json_immediate = None
                             try:
                                 if dataset_option != "None" and retrieved_docs:
                                     print(f"[DEBUG /api/chat] 📎 Creating sources from {len(retrieved_docs)} documents")
                                     source_tuples = []
-                                    for chunk in retrieved_docs:
+                                    for i, chunk in enumerate(retrieved_docs):
                                         src = extract_source_from_metadata(chunk)
                                         paragraph = chunk.page_content if hasattr(chunk, "page_content") else chunk.get("content", "")
                                         source_tuples.append((src, paragraph))
+                                        print(f"[DEBUG /api/chat] 📄 Document {i+1}: source='{src}' (type: {type(src)})")
                                     
-                                    sources_json = await display_sources_with_paragraphs(source_tuples, dataset=dataset_option)
-                                    print(f"[DEBUG /api/chat] 📎 Sending sources with {len(sources_json.get('pdf_elements', []))} elements")
+                                    sources_json_immediate = await display_sources_with_paragraphs(source_tuples, dataset=dataset_option)
+                                    print(f"[DEBUG /api/chat] 📎 Sending sources with {len(sources_json_immediate.get('pdf_elements', []))} elements")
+                                    
+                                    # Debug what we're actually sending
+                                    for i, element in enumerate(sources_json_immediate.get('pdf_elements', [])):
+                                        print(f"[DEBUG /api/chat] 📋 PDF Element {i+1}: name='{element.get('name')}', content_length={len(element.get('content', ''))}")
                                     
                                     # Send sources to frontend immediately 
-                                    yield f"{json.dumps({'sources': sources_json})}\n"
+                                    yield f"{json.dumps({'sources': sources_json_immediate})}\n"
                                 else:
                                     print(f"[DEBUG /api/chat] 📎 No sources to send - dataset: {dataset_option}, docs: {len(retrieved_docs) if retrieved_docs else 0}")
                             except Exception as sources_error:
                                 print(f"[ERROR /api/chat] Error creating immediate sources: {sources_error}")
+                                sources_json_immediate = None
                             
                             # Send completion signal in JSON Lines format
                             yield "[DONE]\n"
                             print("[DEBUG /api/chat] ✅ Stream finished successfully - USER SEES COMPLETE RESPONSE + SOURCES NOW")
                             
+                            # *** SAVE CHAT HISTORY IMMEDIATELY - BEFORE BACKGROUND COMPUTATION ***
+                            print("[DEBUG /api/chat] 💾 Saving chat history immediately with sources...")
+                            try:
+                                cleaned_response = clean_llm_response(full_response)
+                                await save_chat_history_direct(
+                                    user_id=current_user.get("user_id"),
+                                    chat_id=chat_id,
+                                    user_message=user_message,
+                                    bot_response=cleaned_response,
+                                    sources=sources_json_immediate,
+                                    username=current_user.get("username"),
+                                    office_code=current_user.get("office_code")
+                                )
+                                print(f"[DEBUG /api/chat] ✅ Chat history saved immediately with sources: {sources_json_immediate is not None}")
+                            except Exception as save_error:
+                                print(f"[ERROR /api/chat] Error saving chat history immediately: {save_error}")
+                                import traceback
+                                traceback.print_exc()
+                            
                             # *** BACKGROUND COMPUTATION - NO UI BLOCKING ***
-                            # Pass all raw data to background computation
+                            # Pass all raw data to background computation queue
+                            computation_id = f"{chat_id}_{int(time.time() * 1000)}"  # Unique ID with timestamp
                             computation_payload = {
+                                "computation_id": computation_id,
                                 "full_response": full_response,
                                 "stream_start_time": stream_start,
                                 "user_message": user_message,
@@ -2106,14 +2437,16 @@ async def chat_stream(request: Request, current_user: dict = Depends(get_current
                                 "model_name": model_name,
                                 "username": current_user.get("username"),
                                 "office_code": current_user.get("office_code"),
-                                "temperature": temperature
+                                "temperature": temperature,
+                                "sources_json_immediate": sources_json_immediate  # Pass pre-created sources
                             }
                             
-                            # Fire-and-forget computation request
-                            print(f"[DEBUG /api/chat] 🚀 Creating background task for analytics processing...")
-                            task = asyncio.create_task(make_computation_request(computation_payload))
-                            print(f"[DEBUG /api/chat] ✅ Background task created: {task}")
-                            return  # RETURN IMMEDIATELY - NO UI BLOCKING
+                            # Queue computation - NEVER blocks streaming response
+                            await computation_queue.put(computation_payload)
+                            computation_status[computation_id] = "queued"
+                            print(f"[DEBUG /api/chat] ✅ Computation queued: {computation_id}, queue size: {computation_queue.qsize()}")
+                            print(f"[DEBUG /api/chat] 🚀 STREAMING RESPONSE COMPLETE - computation runs in background")
+                            return  # RETURN IMMEDIATELY - STREAMING NEVER BLOCKED
 
                     except json.JSONDecodeError:
                         # Handle non-JSON lines (if any)
@@ -2150,7 +2483,8 @@ async def chat_stream(request: Request, current_user: dict = Depends(get_current
                 model_name=payload["model_name"],
                 username=payload["username"],
                 office_code=payload["office_code"],
-                temperature=payload["temperature"]
+                temperature=payload["temperature"],
+                sources_json_immediate=payload.get("sources_json_immediate")
             )
             
             print(f"[DEBUG make_computation_request] Created ComputationRequest object, calling compute_analytics_and_ragas...")
@@ -2183,9 +2517,17 @@ class ComputationRequest(BaseModel):
     username: str
     office_code: str
     temperature: float
+    sources_json_immediate: Optional[dict] = None  # Pre-created sources from immediate response
 
 @app.post("/api/chat/compute")
 async def compute_analytics_and_ragas(request: ComputationRequest):
+    """
+    COMPUTE API - COMPLETELY SEPARATE FROM STREAMING PROCESS
+    
+    This endpoint handles analytics and RAGAS computation after streaming is complete.
+    It should NOT trigger any frontend source recalculations or affect persistent sources.
+    The frontend has sourcesFinalized flag to prevent interference during computation.
+    """
     """Handle all heavy computation separately from chat response"""
     try:
         print(f"[DEBUG /api/chat/compute] Starting heavy computation for chat_id: {request.chat_id}")
@@ -2236,25 +2578,14 @@ async def compute_analytics_and_ragas(request: ComputationRequest):
                 "cosine_similarity": 0.0, "elapsed_time": stream_elapsed
             }
         
-        # --- Create Sources First (needed for both analytics and chat history) ---
-        print("[DEBUG /api/chat/compute] Creating sources for analytics and chat history...")
-        sources_json = None
-        try:
-            # Format sources if we have retrieved docs
-            if request.dataset_option != "None" and request.retrieved_docs:
-                source_tuples = []
-                for chunk in request.retrieved_docs:
-                    src = extract_source_from_metadata(chunk)
-                    paragraph = chunk.page_content if hasattr(chunk, "page_content") else chunk.get("content")
-                    source_tuples.append((src, paragraph))
-                
-                sources_json = await display_sources_with_paragraphs(source_tuples, dataset=request.dataset_option)
-                print(f"[DEBUG /api/chat/compute] Created sources with {len(sources_json.get('pdf_elements', []))} elements")
-            else:
-                print(f"[DEBUG /api/chat/compute] No sources to create - dataset: {request.dataset_option}, docs: {len(request.retrieved_docs) if request.retrieved_docs else 0}")
-        except Exception as sources_error:
-            print(f"[ERROR /api/chat/compute] Error creating sources: {sources_error}")
-            sources_json = None
+        # --- Use Pre-Created Sources (avoid duplication) ---
+        print("[DEBUG /api/chat/compute] Using pre-created sources from immediate response...")
+        sources_json = request.sources_json_immediate
+        
+        if sources_json:
+            print(f"[DEBUG /api/chat/compute] Using existing sources with {len(sources_json.get('pdf_elements', []))} elements")
+        else:
+            print(f"[DEBUG /api/chat/compute] No sources available from immediate response")
         
         # --- Analytics Logging ---
         print("[DEBUG /api/chat/compute] Logging analytics with sources...")
@@ -2317,26 +2648,11 @@ async def compute_analytics_and_ragas(request: ComputationRequest):
         except Exception as analytics_error:
             print(f"[ERROR /api/chat/compute] Error logging analytics: {analytics_error}")
         
-        # --- Save Chat History with Sources ---
-        print("[DEBUG /api/chat/compute] Saving chat history with sources...")
-        try:
-            
-            # Save to chat history directly to database
-            await save_chat_history_direct(
-                user_id=request.user_id,
-                chat_id=request.chat_id,
-                user_message=request.user_message,
-                bot_response=cleaned_response,
-                sources=sources_json,
-                username=request.username,
-                office_code=request.office_code
-            )
-            print(f"[DEBUG /api/chat/compute] ✅ Chat history saved successfully with sources: {sources_json is not None}")
-                        
-        except Exception as chat_history_error:
-            print(f"[ERROR /api/chat/compute] Error saving chat history: {chat_history_error}")
-            import traceback
-            traceback.print_exc()
+        # --- Chat History Already Saved Immediately After Streaming ---
+        # NOTE: Chat history is saved immediately after streaming in the main /api/chat endpoint
+        # to ensure users see their conversation persist without waiting for background computation.
+        # We don't save it again here to avoid duplicates.
+        print("[DEBUG /api/chat/compute] ✅ Skipping chat history save - already saved immediately after streaming")
         
         # --- RAGAS Evaluation (if available) ---
         if RAGAS_AVAILABLE and request.dataset_option != "None" and contexts:
@@ -2379,6 +2695,39 @@ async def compute_analytics_and_ragas(request: ComputationRequest):
         import traceback
         traceback.print_exc()
         return {"status": "error", "error": str(e), "chat_id": request.chat_id}
+
+@app.get("/api/computation/status")
+async def get_computation_status(current_user: dict = Depends(get_current_user)):
+    """
+    Get current computation queue status - shows background processing without blocking streaming.
+    This endpoint allows the frontend to display computation progress indicators.
+    """
+    try:
+        # Get queue size safely
+        queue_size = 0
+        if computation_queue:
+            queue_size = computation_queue.qsize()
+        
+        # Filter status for current user's computations (optional privacy)
+        user_computations = {}
+        for comp_id, status in computation_status.items():
+            # You could filter by user_id if needed, for now show all
+            user_computations[comp_id] = status
+            
+        return {
+            "queue_size": queue_size,
+            "computation_status": user_computations,
+            "user_id": current_user.get("user_id"),
+            "message": "Computations run in background - streaming never blocked"
+        }
+        
+    except Exception as e:
+        print(f"[ERROR] Failed to get computation status: {e}")
+        return {
+            "queue_size": 0,
+            "computation_status": {},
+            "error": str(e)
+        }
 
 # ------------------------------------------------------------------
 # Source Endpoints
@@ -2459,13 +2808,17 @@ async def get_sources(request: Request, current_user: dict = Depends(get_current
                     retrieved_docs = []
         
         # Execute with timeout (compatible with all Python versions)
-        await asyncio.wait_for(retrieval_with_timeout(), timeout=25)
+        await asyncio.wait_for(retrieval_with_timeout(), timeout=120)  # Increased to 120 seconds for unoptimized queries
                     
     except asyncio.TimeoutError:
-        print(f"[ERROR /api/sources] Timeout after 25 seconds - returning empty sources")
+        print(f"[ERROR /api/sources] Timeout after 120 seconds - returning empty sources")
+        print("[ERROR /api/sources] Consider running database optimization script: optimize_database.sql")
+        print("[ERROR /api/sources] Check if vector indexes exist: SELECT * FROM pg_indexes WHERE tablename LIKE 'document_embeddings%';")
         retrieved_docs = []
     except Exception as e:
         print(f"[ERROR /api/sources] Exception in document retrieval: {e}")
+        import traceback
+        print(f"[ERROR /api/sources] Full traceback: {traceback.format_exc()}")
         retrieved_docs = []
 
     # Process retrieved documents - handle empty case gracefully
@@ -2572,10 +2925,36 @@ def extract_source_from_metadata(chunk):
         metadata = chunk.get("metadata", {})
     else:
         metadata = getattr(chunk, "metadata", {})
+    
+    # Try primary document identifiers first
     source_val = metadata.get("pdf_path") or metadata.get("document_title")
+    
     if not source_val:
+        # Try alternative metadata fields
         source_val = (metadata.get("chapter_title") or metadata.get("section_title") or
-                      metadata.get("sublevel_title") or "Unknown")
+                      metadata.get("sublevel_title") or metadata.get("source") or 
+                      metadata.get("file_path") or metadata.get("filename"))
+    
+    # If still no source, try to extract from any field that looks like a file path
+    if not source_val or source_val == "Unknown":
+        for key, value in metadata.items():
+            if isinstance(value, str) and ('.pdf' in value.lower() or 'document' in key.lower()):
+                source_val = value
+                break
+    
+    # If we have a file path, extract just the filename
+    if source_val and isinstance(source_val, str) and '/' in source_val:
+        from pathlib import Path
+        source_val = Path(source_val).name
+        # Remove duplicate .pdf.pdf extension if present
+        if source_val.endswith('.pdf.pdf'):
+            source_val = source_val[:-4]
+    
+    # Final fallback
+    if not source_val:
+        source_val = "Unknown Document"
+        
+    print(f"[DEBUG extract_source_from_metadata] Final extracted source: '{source_val}' from metadata keys: {list(metadata.keys())}")
     return source_val
 
 
@@ -3009,7 +3388,7 @@ async def positive_feedback(feedback: FeedbackInput, current_user: dict = Depend
             office_code,
             chat_id,
             node_count, # Pass fetched node_count
-            None, None, None, None, None, None, None, None, None, None, None # Pass None for all RAGAS metrics
+            None, None, None, None, None, None, None, None, None, None, None, None, None # Pass None for all 13 RAGAS/LLMEvaluator metrics
         )
         
         # Update the analytics table separately
@@ -3098,7 +3477,7 @@ async def negative_feedback(feedback: FeedbackInput, current_user: dict = Depend
             office_code,
             chat_id,
             node_count, # Pass fetched node_count
-            None, None, None, None, None, None, None, None, None, None, None # Pass None for all RAGAS metrics
+            None, None, None, None, None, None, None, None, None, None, None, None, None # Pass None for all 13 RAGAS/LLMEvaluator metrics
         )
         
         # Update the analytics table separately
@@ -3196,7 +3575,7 @@ async def neutral_feedback(
             office_code,
             chat_id,
             node_count,
-            *([None] * 11)  # placeholders for RAGAS metrics
+            *([None] * 13)  # placeholders for all 13 RAGAS/LLMEvaluator metrics
         )
 
         # 3) Update analytics
@@ -3636,7 +4015,66 @@ async def get_ragas_analytics(current_user: dict = Depends(get_current_user)):
 # All endpoints return JSON error messages with appropriate HTTP status codes,
 # and debug prints are included where useful (e.g., session creation).
 
-# ------------------------------------------------------------------
+async def process_computation_queue():
+    """
+    Background worker that processes computations one at a time.
+    CRITICAL: This ensures computations never interfere with streaming responses.
+    """
+    print("[DEBUG] 🚀 Computation queue worker started - ready to process background analytics")
+    
+    while True:
+        try:
+            # Get next computation from queue (blocks until available)
+            payload = await computation_queue.get()
+            computation_id = payload.get("computation_id", "unknown")
+            chat_id = payload.get("chat_id", "unknown")
+            
+            print(f"[DEBUG Queue Worker] 📊 Starting computation: {computation_id} for chat: {chat_id}")
+            print(f"[DEBUG Queue Worker] 📋 Queue size after dequeue: {computation_queue.qsize()}")
+            computation_status[computation_id] = "processing"
+            
+            # Process the computation using existing function
+            request_obj = ComputationRequest(
+                full_response=payload["full_response"],
+                stream_start_time=payload["stream_start_time"],
+                user_message=payload["user_message"],
+                user_id=payload["user_id"],
+                chat_id=payload["chat_id"],
+                dataset_option=payload["dataset_option"],
+                retrieved_docs=payload["retrieved_docs"],
+                model_name=payload["model_name"],
+                username=payload["username"],
+                office_code=payload["office_code"],
+                temperature=payload["temperature"],
+                sources_json_immediate=payload.get("sources_json_immediate")
+            )
+            
+            # Run the heavy computation
+            result = await compute_analytics_and_ragas(request_obj)
+            computation_status[computation_id] = "completed"
+            print(f"[DEBUG Queue Worker] ✅ Computation completed: {computation_id}")
+            
+            # Clean up old status entries (keep last 100)
+            if len(computation_status) > 100:
+                old_keys = list(computation_status.keys())[:-50]  # Keep only last 50
+                for key in old_keys:
+                    del computation_status[key]
+            
+        except Exception as e:
+            if 'computation_id' in locals():
+                computation_status[computation_id] = "error"
+                print(f"[ERROR Queue Worker] ❌ Computation failed: {computation_id}, error: {e}")
+            else:
+                print(f"[ERROR Queue Worker] ❌ Computation processing error: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            # Mark task as done
+            computation_queue.task_done()
+
+    response_headers = {"X-Chat-ID": chat_id}
+
+    # ------------------------------------------------------------------
 # Run the FastAPI Application
 # ------------------------------------------------------------------
 if __name__ == "__main__":
