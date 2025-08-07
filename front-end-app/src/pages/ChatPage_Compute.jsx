@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import CssBaseline from '@mui/material/CssBaseline';
 import AppTheme from '../components/shared-theme/AppTheme.jsx';
@@ -15,8 +15,8 @@ import Toolbar from '@mui/material/Toolbar';
 import { Box } from '@mui/material'; 
 import ReactMarkdown from 'react-markdown';
 import '../components/shared-theme/ChatPage.css';
-import FeedbackButtons from '../components/shared-theme/feedbackbuttons';
-import { getPersonas, logoutUser, getChatHistories, getUserPreferences, updateUserPreferences } from '../api'; // Import getPersonas, logoutUser, getChatHistories, and user preferences API functions
+import FeedbackButtons from '../components/shared-theme/feedbackbuttons.jsx';
+import { getPersonas, logoutUser, getChatHistories, getUserPreferences, updateUserPreferences } from '../api.js'; // Import getPersonas, logoutUser, getChatHistories, and user preferences API functions
 import Snackbar from '@mui/material/Snackbar';
 import Alert from '@mui/material/Alert';
 import axios from 'axios';
@@ -25,7 +25,7 @@ import ExpandLessIcon from '@mui/icons-material/ExpandLess';
 import ContentCopyIcon from '@mui/icons-material/ContentCopy';
 import IconButton from '@mui/material/IconButton';
 
-const availableModels = ["mistral:latest", "sskostyaev/mistral:7b-instruct-v0.2-q6_K-32k", "mistral:7b-instruct-v0.3-q3_K_M"];
+const availableModels = ["mistral:latest", "sskostyaev/mistral:7b-instruct-v0.2-q6_K-32k", "mistral:7b-instruct-v0.3-q3_K_M", "mistral-STRATGPT:latest"];
 
 // The readme markdown text
 const readmeText = `
@@ -98,7 +98,8 @@ function ChatPage() {
 
   // Add state for tracking generation and abort controller
   const [isGenerating, setIsGenerating] = useState(false);
-  const abortControllerRef = React.useRef(null);
+  const [streamingMessages, setStreamingMessages] = useState(new Set());
+  const [abortControllers, setAbortControllers] = useState(new Map());
 
   // Add state for tracking all unique sources and dropdown visibility
   const [allUniqueSources, setAllUniqueSources] = useState([]);
@@ -116,6 +117,10 @@ function ChatPage() {
   // Add a dedicated state variable for forcing UI refreshes
   // Add this with other state variables around line ~50
   const [forceUpdate, setForceUpdate] = useState(0);
+
+  // Add a state flag to prevent source recalculations during computation
+  const [sourcesFinalized, setSourcesFinalized] = useState(false);
+  const [isComputing, setIsComputing] = useState(false);
 
   // Update the toggle sources function to automatically show the most recent question
   // Add a new ref to track the sources dropdown container
@@ -270,8 +275,8 @@ function ChatPage() {
             const total = calculateTotalSources();
             setSourcesCount(total);
             
-            // Force a UI refresh
-            setForceUpdate(prev => prev + 1);
+            // Force a UI refresh (don't interfere with aggressive refresh trigger)
+            setForceUpdate(prev => prev < 100 ? prev + 1 : prev);
             
             // Also force the sources dropdown to update if it's open
             if (showSourcesDropdown) {
@@ -303,7 +308,35 @@ function ChatPage() {
 
         // Transform raw PDF elements into the expected format with title and content
         const formattedSources = rawSourcesForFeedback.map((element, index) => {
-          const title = element.name || element.title || `Document ${index + 1}`;
+          // ENHANCED TITLE EXTRACTION: Try multiple sources for document titles
+          let title = element.name || element.title;
+          
+          // If no direct title, try to extract from pdf_url path
+          if (!title && element.pdf_url) {
+            const urlParts = element.pdf_url.split('/');
+            const fileName = urlParts[urlParts.length - 1];
+            if (fileName && fileName !== '') {
+              // Remove file extension and decode
+              title = decodeURIComponent(fileName.replace(/\.pdf$/i, ''));
+              console.log("[DEBUG] Extracted title from pdf_url:", title);
+            }
+          }
+          
+          // If still no title, try to extract from markdown content using better patterns
+          if (!title && sourcesData.content) {
+            const parsedFromMarkdown = parseSourcesMarkdown(sourcesData.content);
+            if (parsedFromMarkdown[index] && parsedFromMarkdown[index].title) {
+              title = parsedFromMarkdown[index].title;
+              console.log("[DEBUG] Extracted title from markdown:", title);
+            }
+          }
+          
+          // Final fallback
+          if (!title) {
+            title = `Document ${index + 1}`;
+            console.log("[DEBUG] Using fallback title:", title);
+          }
+          
           const content = extractSourceContent(sourcesData.content, title);
           
           return {
@@ -313,7 +346,7 @@ function ChatPage() {
           };
         });
         
-        console.log("[DEBUG] Formatted sources for display:", formattedSources);
+        console.log("[DEBUG] Formatted sources with enhanced title extraction:", formattedSources.map(s => ({ title: s.title, hasContent: !!s.content })));
         console.log("[DEBUG] Sample source content extraction:", formattedSources[0]?.content?.substring(0, 100) + "...");
         
         // Return the properly formatted source data
@@ -336,7 +369,7 @@ function ChatPage() {
   
   
   
-  // Modify the chat history useEffect to remove polling
+  // Fetch chat histories when component mounts
   useEffect(() => {
     console.log("[DEBUG useEffect] Component mounted, fetching chat histories...");
     console.log("[DEBUG useEffect] Session token exists:", !!sessionToken);
@@ -345,6 +378,34 @@ function ChatPage() {
     
     // No polling interval setup or cleanup needed
   }, [sessionToken]);
+
+  // Handle initial chat selection after both chat histories and hidden chats are loaded
+  useEffect(() => {
+    console.log("[DEBUG useEffect initial selection] Checking initial chat selection...");
+    console.log("[DEBUG useEffect initial selection] chatHistories.length:", chatHistories.length);
+    console.log("[DEBUG useEffect initial selection] selectedChat:", selectedChat);
+    console.log("[DEBUG useEffect initial selection] hiddenChats.length:", hiddenChats.length);
+    
+    // Only run if we have chat histories, no chat selected, and hidden chats are loaded
+    if (chatHistories.length > 0 && !selectedChat) {
+      console.log("[DEBUG useEffect initial selection] 🔍 Looking for initial chat to load");
+      
+      const nonHiddenChats = chatHistories.filter(chat => !hiddenChats.includes(chat.id));
+      console.log("[DEBUG useEffect initial selection] 📋 Non-hidden chats:", nonHiddenChats.map(h => h.id));
+      
+      let chatToLoad;
+      if (nonHiddenChats.length > 0) {
+        chatToLoad = nonHiddenChats[0].id;
+        console.log("[DEBUG useEffect initial selection] ✅ Auto-selecting most recent non-hidden chat:", chatToLoad);
+      } else {
+        chatToLoad = chatHistories[0].id;
+        console.log("[DEBUG useEffect initial selection] ⚠️ All chats are hidden, falling back to first chat:", chatToLoad);
+      }
+      
+      // Load the selected chat
+      loadChatMessages(chatToLoad);
+    }
+  }, [chatHistories, hiddenChats, selectedChat]); // Run when any of these change
 
   // Create a separate fetchChatHistories function outside the useEffect
   const fetchChatHistories = async () => {
@@ -402,18 +463,10 @@ function ChatPage() {
         });
       });
       
-      // Always load messages for the selected chat or default to first chat
-      if (sortedHistories.length > 0) {
-        const chatToLoad = selectedChat || sortedHistories[0].id;
-        console.log("[DEBUG fetchChatHistories] Found", sortedHistories.length, "chats");
-        console.log("[DEBUG fetchChatHistories] Selected chat:", selectedChat);
-        console.log("[DEBUG fetchChatHistories] Loading messages for chat:", chatToLoad);
-        console.log("[DEBUG fetchChatHistories] Available chats:", sortedHistories.map(h => ({id: h.id, title: h.title})));
-        // Always load messages on refresh to ensure they persist in UI
-        await loadChatMessages(chatToLoad);
-      } else {
-        console.log("[DEBUG fetchChatHistories] No chat histories found");
-      }
+      // Chat loading is now handled by separate useEffect
+      console.log("[DEBUG fetchChatHistories] Found", sortedHistories.length, "chats");
+      console.log("[DEBUG fetchChatHistories] Available chats:", sortedHistories.map(h => ({id: h.id, title: h.title})));
+      console.log("[DEBUG fetchChatHistories] Initial chat selection will be handled by separate useEffect");
     } catch (error) {
       console.error("Error fetching chat histories:", error);
       setChatHistories([]);
@@ -464,15 +517,25 @@ function ChatPage() {
           // Process messages - simplified approach
           let processedMessages = [];
           let initialSourceStates = {};
+          let tempSourcesByQuestion = {};
+          let tempAllUniqueSources = [];
           
           if (Array.isArray(chatInfo.messages)) {
             console.log("[DEBUG loadChatMessages] Processing", chatInfo.messages.length, "messages");
             console.log("[DEBUG loadChatMessages] Raw messages from backend:", chatInfo.messages);
             
-            // Simplify: just normalize the messages without complex source logic
+            let questionCounter = 0;
+            
+            // Process messages and build side panel data
             processedMessages = chatInfo.messages.map((msg, index) => {
               console.log(`[DEBUG loadChatMessages] 🔍 Processing message ${index}:`, msg);
               console.log(`[DEBUG loadChatMessages] 🔍 Message ${index} keys:`, Object.keys(msg));
+              
+              // Count user messages for question numbering
+              if (msg.sender === 'user') {
+                questionCounter++;
+              }
+              
               const normalizedMsg = {
                 sender: msg.sender || 'bot', // Default to bot if not specified
                 content: msg.content || msg.text || "",
@@ -482,13 +545,61 @@ function ChatPage() {
                 sourcesMarkdown: msg.sourcesMarkdown || ""
               };
               
-              // If this message has sources, initialize expansion state
-              if (normalizedMsg.hasSources) {
-                  initialSourceStates[index] = false;
-                console.log("[DEBUG loadChatMessages] 📋 Message", index, "has sources:");
+              // If this message has sources, initialize expansion state AND populate side panel
+              if (normalizedMsg.hasSources && normalizedMsg.sender === 'bot') {
+                initialSourceStates[index] = false;
+                console.log("[DEBUG loadChatMessages] 📋 Message", index, "has sources for question", questionCounter);
                 console.log("[DEBUG loadChatMessages] 📄 sourcesMarkdown length:", normalizedMsg.sourcesMarkdown?.length || 0);
                 console.log("[DEBUG loadChatMessages] 📑 sources type:", typeof normalizedMsg.sources);
                 console.log("[DEBUG loadChatMessages] 📑 sources structure:", normalizedMsg.sources);
+                
+                // Parse sources for side panel
+                let sourcesForSidePanel = [];
+                
+                // Handle array format sources
+                if (Array.isArray(normalizedMsg.sources) && normalizedMsg.sources.length > 0) {
+                  console.log("[DEBUG loadChatMessages] 📋 Processing sources in array format");
+                  sourcesForSidePanel = normalizedMsg.sources.map(source => ({
+                    title: source.name || source.title || 'Document',
+                    content: source.content || 'No content available',
+                    pdf_url: source.pdf_url || ''
+                  }));
+                } 
+                // Handle object format sources: { content: "...", pdf_elements: [...] }
+                else if (normalizedMsg.sources && typeof normalizedMsg.sources === 'object' && normalizedMsg.sources.pdf_elements && Array.isArray(normalizedMsg.sources.pdf_elements)) {
+                  console.log("[DEBUG loadChatMessages] 📋 Processing sources in object format with pdf_elements");
+                  sourcesForSidePanel = normalizedMsg.sources.pdf_elements.map((element, idx) => ({
+                    title: element.name || element.title || `Document ${idx + 1}`,
+                    content: element.content || 'No content available',
+                    pdf_url: element.pdf_url || ''
+                  }));
+                } 
+                // Fallback: parse from sourcesMarkdown
+                else if (normalizedMsg.sourcesMarkdown) {
+                  console.log("[DEBUG loadChatMessages] 📋 Parsing sources from sourcesMarkdown");
+                  sourcesForSidePanel = parseSourcesMarkdown(normalizedMsg.sourcesMarkdown);
+                }
+                
+                console.log("[DEBUG loadChatMessages] 📋 Final sourcesForSidePanel:", sourcesForSidePanel.length, "sources");
+                
+                // Add to side panel data structures
+                if (sourcesForSidePanel.length > 0) {
+                  console.log("[DEBUG loadChatMessages] 📋 Adding", sourcesForSidePanel.length, "sources to side panel for question", questionCounter);
+                  
+                  // Add to question-specific sources
+                  if (!tempSourcesByQuestion[questionCounter]) {
+                    tempSourcesByQuestion[questionCounter] = [];
+                  }
+                  tempSourcesByQuestion[questionCounter] = sourcesForSidePanel;
+                  
+                  // Add to all unique sources (avoiding duplicates)
+                  const currentTitles = new Set(tempAllUniqueSources.map(s => s.title));
+                  sourcesForSidePanel.forEach(source => {
+                    if (!currentTitles.has(source.title)) {
+                      tempAllUniqueSources.push(source);
+                    }
+                  });
+                }
               }
               
               console.log("[DEBUG loadChatMessages] Processed message", index, ":", {
@@ -507,11 +618,41 @@ function ChatPage() {
           setSelectedChat(chatId);
           setMessages(processedMessages);
           
-          // Reset sources when changing chats
+          // **CRITICAL: Update side panel data structures**
+          console.log("[DEBUG loadChatMessages] 📋 Setting side panel data:");
+          console.log("[DEBUG loadChatMessages] 📋 sourcesByQuestion:", tempSourcesByQuestion);
+          console.log("[DEBUG loadChatMessages] 📋 allUniqueSources count:", tempAllUniqueSources.length);
+          
+          setSourcesByQuestion(tempSourcesByQuestion);
+          setAllUniqueSources(tempAllUniqueSources);
+          
+          // Update sources count
+          const totalSources = Object.values(tempSourcesByQuestion).reduce((acc, sources) => acc + sources.length, 0);
+          console.log("[DEBUG loadChatMessages] 📋 Total sources count calculated:", totalSources);
+          console.log("[DEBUG loadChatMessages] 📋 Sources breakdown by question:", Object.keys(tempSourcesByQuestion).map(q => `Q${q}: ${tempSourcesByQuestion[q].length}`));
+          setSourcesCount(totalSources);
+          
+          // DELAY SOURCES FINALIZATION: If we loaded existing sources, allow state updates to settle first
+          if (totalSources > 0) {
+            console.log("[DEBUG loadChatMessages] 🔒 Delaying finalization of", totalSources, "sources from loaded chat");
+            setTimeout(() => {
+              console.log("[DEBUG loadChatMessages] 🔒 Now finalizing sources from loaded chat");
+              setSourcesFinalized(true);
+            }, 300); // Shorter delay for loaded chats since no streaming involved
+          }
+          
+          // Reset other source-related state
           setLastInteractionData(null);
           setSourceContent('');
           // Initialize expansion states for all messages with sources
           setExpandedMessageSources(initialSourceStates);
+          
+          // Initialize expansion states for side panel
+          const initialExpandedQuestions = {};
+          Object.keys(tempSourcesByQuestion).forEach(questionNum => {
+            initialExpandedQuestions[questionNum] = false;
+          });
+          setExpandedQuestions(initialExpandedQuestions);
           
           // Also update the chat histories with the loaded messages
           setChatHistories(prev => {
@@ -542,6 +683,9 @@ function ChatPage() {
   // Modify the handler for selecting a chat
   const handleSelectChat = (chatId) => {
     if (chatId !== selectedChat) {
+      // CRITICAL: Set the selected chat FIRST - this was missing!
+      setSelectedChat(chatId);
+      
       // Reset all sources-related state when switching chats
       setAllUniqueSources([]);
       setSourcesByQuestion({});
@@ -551,6 +695,10 @@ function ChatPage() {
       setSourcesCount(0);
       setSourceContent('');
       setShowSourcesDropdown(false);
+      
+      // RESET SOURCES FINALIZATION: Allow recalculation for new chat
+      console.log("[DEBUG handleSelectChat] 🔄 Resetting sources finalization for new chat");
+      setSourcesFinalized(false);
       
       // Load the selected chat messages
       loadChatMessages(chatId);
@@ -608,17 +756,38 @@ function ChatPage() {
     if (!userInput.trim()) return;
 
     const currentUserQuery = userInput;
+    const messageId = `${Date.now()}-${Math.random()}`;  // Unique ID for this message
+    
     setMessages(prev => [...prev, { sender: 'user', content: currentUserQuery }]);
     setUserInput('');
-    setIsGenerating(true);
+    
+    // STREAMING NEVER BLOCKED: Don't set global isGenerating
+    console.log("[DEBUG handleSendMessage] 🚀 Starting new streaming request - UI remains responsive");
+    
+    // RESET SOURCES FINALIZATION: Allow recalculation for new interaction
+    console.log("[DEBUG handleSendMessage] 🔄 Resetting sources finalization for new interaction");
+    setSourcesFinalized(false);
 
-    // **CRITICAL: Ensure we have a chat selected - if not, select the top chat**
+    // **CRITICAL: Ensure we have a chat selected - if not, select the top non-hidden chat**
     let currentChatId = selectedChat;
     if (!currentChatId && chatHistories.length > 0) {
-      // Default to the first chat in the list (most recent)
-      currentChatId = chatHistories[0].id;
+      // Default to the first non-hidden chat in the list (most recent)
+      console.log("[DEBUG handleSendMessage] 🔍 No chat selected, looking for non-hidden chat");
+      console.log("[DEBUG handleSendMessage] 📋 Hidden chats:", hiddenChats);
+      console.log("[DEBUG handleSendMessage] 📋 Available chats:", chatHistories.map(h => h.id));
+      
+      const nonHiddenChats = chatHistories.filter(chat => !hiddenChats.includes(chat.id));
+      console.log("[DEBUG handleSendMessage] 📋 Non-hidden chats found:", nonHiddenChats.length);
+      
+      if (nonHiddenChats.length > 0) {
+        currentChatId = nonHiddenChats[0].id;
+        console.log("[DEBUG handleSendMessage] ✅ No chat selected, defaulting to top non-hidden chat:", currentChatId);
+      } else {
+        // Fallback to first chat if all are hidden
+        currentChatId = chatHistories[0].id;
+        console.log("[DEBUG handleSendMessage] ⚠️ No chat selected and all chats are hidden, defaulting to first chat:", currentChatId);
+      }
       setSelectedChat(currentChatId);
-      console.log("[DEBUG] No chat selected, defaulting to top chat:", currentChatId);
       
       // Load the messages for this chat
       await loadChatMessages(currentChatId);
@@ -626,8 +795,7 @@ function ChatPage() {
       // If no chats exist at all, user must create one manually
       console.error("[ERROR] No chats available and none selected. User must create a new chat.");
       alert("Please create a new chat first by clicking the '+' button.");
-      setIsGenerating(false);
-      return;
+      return; // Don't block UI, just return
     }
 
     const payload = {
@@ -640,6 +808,7 @@ function ChatPage() {
 
     let botMessage = "";
     let messageIndex = null;
+    let sourcesReceivedDuringStreaming = false; // Track if sources were received during streaming
 
     try {
       setMessages(prev => {
@@ -647,9 +816,13 @@ function ChatPage() {
         return [...prev, { sender: 'bot', content: "" }];
       });
 
-      // Create abort controller for this request
+      // Create unique abort controller for this request
       const abortController = new AbortController();
-      abortControllerRef.current = abortController;
+      setAbortControllers(prev => new Map(prev).set(messageId, abortController));
+      
+      // Track this message as streaming
+      setStreamingMessages(prev => new Set(prev).add(messageId));
+      console.log("[DEBUG handleSendMessage] 📡 Message streaming started:", messageId);
 
       const response = await fetch('https://j1chatbotbeta.usgovvirginia.cloudapp.usgovcloudapi.net/api/chat', {
         method: 'POST',
@@ -658,17 +831,24 @@ function ChatPage() {
           'Authorization': sessionToken,
         },
         body: JSON.stringify(payload),
-        signal: abortController.signal, // ⭐ This is the missing piece!
+        signal: abortController.signal,
       });
 
       if (!response.ok) {
         console.error("Error sending message:", response.statusText);
         setMessages(prev => {
           const updated = [...prev];
-          updated[messageIndex].content = `Error processing request: ${response.statusText}`;
+          if (updated[messageIndex]) {
+            updated[messageIndex].content = `Error processing request: ${response.statusText}`;
+          }
           return updated;
         });
-        setIsGenerating(false);
+        // Remove from streaming tracking
+        setStreamingMessages(prev => {
+          const newSet = new Set(prev);
+          newSet.delete(messageId);
+          return newSet;
+        });
         return;
       }
 
@@ -689,50 +869,139 @@ function ChatPage() {
 
         // Process complete lines
         while (partialLine.includes('\n')) {
-          const newlineIndex = partialLine.indexOf('\n');
-          const line = partialLine.substring(0, newlineIndex).trim(); // Extract line
-          partialLine = partialLine.substring(newlineIndex + 1); // Remove line from buffer
+          const lineBreakIndex = partialLine.indexOf('\n');
+          const currentLine = partialLine.slice(0, lineBreakIndex).trim();
+          partialLine = partialLine.slice(lineBreakIndex + 1);
 
-          if (line) { // Only process non-empty lines
-            // Handle the special [DONE] marker
-            if (line === '[DONE]') {
-              console.log('[DEBUG] Received [DONE] marker - stream complete');
-              streamComplete = true;
-              break; // Break from line processing loop
-            }
-            
-            try {
-              const parsed = JSON.parse(line);
-              if (parsed.token) {
-                botMessage += parsed.token;
+          if (!currentLine) continue;
+
+          console.log("[DEBUG] Processing line:", currentLine);
+
+          // Check for special end markers
+          if (currentLine === "[DONE]" || currentLine === " [DONE]") {
+            console.log("[DEBUG] 🏁 Stream complete marker received");
+            streamComplete = true;
+            break;
+          }
+
+          try {
+            const parsed = JSON.parse(currentLine);
+            if (parsed.sources) {
+              sourcesReceivedDuringStreaming = true;
+              
+              // Handle both string and object formats for sources
+              let sourcesData;
+              if (typeof parsed.sources === 'string') {
+                // Legacy string format
+                sourcesData = parsed.sources.trim();
+              } else if (typeof parsed.sources === 'object' && parsed.sources !== null) {
+                // New object format with content and pdf_elements
+                sourcesData = parsed.sources;
+              }
+              
+              if (sourcesData) {
                 setMessages(prev => {
                   const updated = [...prev];
-                  updated[messageIndex].content = botMessage;
+                  if (updated[messageIndex]) {
+                    // Set both sourcesMarkdown and sources for compatibility
+                    if (typeof sourcesData === 'string') {
+                      updated[messageIndex].sourcesMarkdown = sourcesData;
+                    } else {
+                      // For object format, use the content for markdown and the full object for sources
+                      updated[messageIndex].sourcesMarkdown = sourcesData.content || '';
+                      updated[messageIndex].sources = sourcesData; // Full object for getSourcesFromMessage
+                    }
+                    updated[messageIndex].hasSources = true;
+                  }
                   return updated;
                 });
               }
-            } catch (error) {
-              console.error("Error parsing line:", error, "Line content:", JSON.stringify(line));
             }
+            if (parsed.error) {
+              console.error("[ERROR] Received error from stream:", parsed.error);
+              setMessages(prev => {
+                const updated = [...prev];
+                if (updated[messageIndex]) {
+                  updated[messageIndex].content += `\n\nError: ${parsed.error}`;
+                }
+                return updated;
+              });
+            } else if (parsed.token) {
+              botMessage += parsed.token;
+              setMessages(prev => {
+                const updated = [...prev];
+                if (updated[messageIndex]) {
+                  updated[messageIndex].content = botMessage;
+                }
+                return updated;
+              });
+            }
+          } catch (e) {
+            console.log("[DEBUG] Non-JSON line, treating as text:", currentLine);
+            botMessage += currentLine;
+            setMessages(prev => {
+              const updated = [...prev];
+              if (updated[messageIndex]) {
+                updated[messageIndex].content = botMessage;
+              }
+              return updated;
+            });
           }
         }
-        
-        // If we received [DONE], break from the main streaming loop
-        if (streamComplete) {
-          break;
-        }
+
+        if (streamComplete) break;
       }
+
+      console.log("[DEBUG] 📁 Stream processing complete for message:", messageId);
+      
+      // STREAMING NEVER BLOCKED: Remove from streaming tracking instead of setting global flag
+      setStreamingMessages(prev => {
+        const newSet = new Set(prev);
+        newSet.delete(messageId);
+        console.log("[DEBUG] 📁 Remaining streaming messages:", newSet.size);
+        return newSet;
+      });
+      
+      // Clean up abort controller
+      setAbortControllers(prev => {
+        const newMap = new Map(prev);
+        newMap.delete(messageId);
+        return newMap;
+      });
 
       console.log("[DEBUG] 📁 Stream processing complete, checking for sources...");
       console.log("[DEBUG] 📁 Dataset:", dataset, "| Current query:", currentUserQuery);
       console.log("[DEBUG] 📁 About to set isGenerating to false");
 
       setIsGenerating(false); // Mark generation as complete after stream ends
+      
+      // DELAY SOURCES FINALIZATION: Allow all async state updates to complete first
+      console.log("[DEBUG] 📁 Delaying sources finalization to allow state updates to complete");
+      setTimeout(() => {
+        console.log("[DEBUG] 📁 Now finalizing sources after state updates have settled");
+        
+        // TRIGGER AGGRESSIVE REFRESH: Use a flag to trigger refresh in useEffect with current messages state
+        console.log("[DEBUG] 📁 🔄 TRIGGERING AGGRESSIVE REFRESH via state update");
+        setForceUpdate(prev => prev + 100); // Large increment to trigger refresh
+        
+        // Delay finalization to allow the aggressive refresh to complete
+        setTimeout(() => {
+          setSourcesFinalized(true);
+          console.log("[DEBUG] 📁 🔒 Sources finalized after aggressive refresh");
+        }, 100); // Short delay to let the useEffect-based refresh complete
+      }, 300); // Reduced delay since race condition is fixed - just need time for UI updates
 
-      console.log("[DEBUG] 📁 Checking dataset condition - dataset !== 'None':", dataset !== "None");
-      // **FETCH SOURCES after streaming completes (if dataset is not "None")**
-      if (dataset !== "None") {
-        console.log("[DEBUG] 📁 ENTERING source fetch block");
+      console.log("[DEBUG] 📁 Checking if sources were received during streaming...");
+      // **SOURCES SHOULD ALREADY BE RECEIVED DURING STREAMING - NO SEPARATE FETCH NEEDED**
+      
+      console.log("[DEBUG] 📁 🎯 sourcesReceivedDuringStreaming flag:", sourcesReceivedDuringStreaming);
+      console.log("[DEBUG] 📁 🎯 dataset:", dataset);
+      console.log("[DEBUG] 📁 🎯 Should trigger fallback:", !sourcesReceivedDuringStreaming && dataset !== "None");
+      
+      if (!sourcesReceivedDuringStreaming && dataset !== "None") {
+        // Fallback: only fetch sources separately if they weren't received during streaming
+        console.log("[DEBUG] 📁 🚫 FALLBACK TRIGGERED - No sources received during streaming, calling fetchSources");
+        console.log("[DEBUG] 📁 🚫 THIS SHOULD NOT HAPPEN IF STREAMING WORKED PROPERLY");
         try {
           console.log("[DEBUG] 🔍 Fetching sources after streaming...");
           console.log("[DEBUG] 🔍 Calling fetchSources with query:", currentUserQuery, "dataset:", dataset);
@@ -751,32 +1020,78 @@ function ChatPage() {
               content: source.content || 'No content available'
             }));
             
-            // Create sourcesMarkdown as OBJECT (like older messages) instead of string
-            const sourcesMarkdownObject = {
-              content: `**Relevant Sources and Extracted Paragraphs:**\n\n${sources.map((source, idx) => 
-                `**Source:** **${source.title || source.name || 'Document'}**\n\n**Extracted Paragraph:**\n\n${source.content || 'No content available'}\n\nView full PDF: [Click Here](${source.pdf_url || ''})\n\n`
-              ).join('')}`,
-              pdf_elements: pdf_elements
-            };
+            // Create sourcesMarkdown as STRING (like ChatPage_Original.jsx working format)
+            const sourcesMarkdownString = `**Relevant Sources and Extracted Paragraphs:**\n\n${sources.map((source, idx) => 
+              `**Source:** **${source.title || source.name || 'Document'}**\n\n**Extracted Paragraph:**\n\n${source.content || 'No content available'}\n\nView full PDF: [Click Here](${source.pdf_url || ''})\n\n`
+            ).join('')}`;
             
-            console.log("[DEBUG] ✅ Generated sourcesMarkdown object with", pdf_elements.length, "pdf_elements");
+            console.log("[DEBUG] ✅ Generated sourcesMarkdown string with", pdf_elements.length, "pdf_elements");
             
             setMessages(prev => {
               const updated = [...prev];
               if (updated[messageIndex]) {
                 updated[messageIndex].hasSources = true;
-                updated[messageIndex].sources = sourcesMarkdownObject; // Use object format
-                updated[messageIndex].sourcesMarkdown = sourcesMarkdownObject; // Use object format
+                updated[messageIndex].sources = pdf_elements; // ARRAY format for getSourcesFromMessage
+                updated[messageIndex].sourcesMarkdown = sourcesMarkdownString; // STRING format like ChatPage_Original.jsx
               }
               return updated;
             });
+            
+            // **CRITICAL: Update side panel data structures immediately**
+            console.log("[DEBUG] 📋 Updating side panel with sources:", sources.length);
+            
+            // Get the current question number (count of user messages)
+            const questionNumber = messages.filter(msg => msg.sender === 'user').length;
+            console.log("[DEBUG] 📋 Current question number:", questionNumber);
+            
+            // Update sourcesByQuestion for the side panel
+            setSourcesByQuestion(prev => {
+              const updated = { ...prev };
+              if (!updated[questionNumber]) {
+                updated[questionNumber] = [];
+              }
+              
+              // Add the new sources, avoiding duplicates
+              const currentTitles = new Set(updated[questionNumber].map(s => s.title));
+              sources.forEach(source => {
+                if (!currentTitles.has(source.title)) {
+                  updated[questionNumber].push(source);
+                }
+              });
+              
+              console.log("[DEBUG] 📋 Updated sourcesByQuestion:", updated);
+              return updated;
+            });
+            
+            // Update allUniqueSources for the side panel dropdown
+            setAllUniqueSources(prevSources => {
+              // Create a Set with current titles for easy duplicate checking
+              const currentSourceTitles = new Set(prevSources.map(source => source.title));
+              
+              // Filter out sources we already have
+              const newSources = sources.filter(source => !currentSourceTitles.has(source.title));
+              console.log("[DEBUG] 📋 Adding", newSources.length, "new unique sources to side panel");
+              
+              // Return updated array with new unique sources added
+              return [...prevSources, ...newSources];
+            });
+            
+            // Force update the sources count for the side panel button (finalization is delayed)
+            setTimeout(() => {
+              const total = calculateTotalSources();
+              setSourcesCount(total);
+              console.log("[DEBUG] 📋 Updated sources count:", total, "sourcesFinalized:", sourcesFinalized);
+              
+              // Force UI refresh (don't interfere with aggressive refresh trigger)
+              setForceUpdate(prev => prev < 100 ? prev + 1 : prev);
+            }, 250); // Longer delay to ensure all state cascades complete
             
             // Update lastInteractionData with sources for feedback buttons
             const newInteractionData = {
               question: currentUserQuery,
               answer: botMessage,
               sources: pdf_elements, // Use pdf_elements array for backend compatibility
-              sourcesMarkdown: sourcesMarkdownObject.content, // Use content string for backend compatibility
+              sourcesMarkdown: sourcesMarkdownString, // Use string format for backend compatibility
               model: selectedModel,
               temperature: temperature,
               dataset: dataset,
@@ -809,10 +1124,9 @@ function ChatPage() {
         } catch (error) {
           console.error("[DEBUG] ❌ Error fetching sources:", error);
         }
-        console.log("[DEBUG] 📁 COMPLETED source fetch block - proceeding to save");
-      } else {
-        console.log("[DEBUG] 🚫 Dataset is 'None', skipping source fetch");
-        // Dataset is "None", no sources to fetch but still set interaction data
+      } else if (!sourcesReceivedDuringStreaming) {
+        // No sources from stream and dataset is "None" or no sources available
+        console.log("[DEBUG] 🚫 No sources received during streaming and dataset is 'None' or no sources available");
         const newInteractionDataNone = {
           question: currentUserQuery,
           answer: botMessage,
@@ -822,91 +1136,57 @@ function ChatPage() {
           temperature: temperature,
           dataset: dataset,
           personality: persona,
-          chat_id: currentChatId, // Use the current chat ID
+          chat_id: currentChatId,
           elapsed_time: 0,
           messageIndex: messageIndex
         };
-        console.log("[DEBUG] 🎯 Setting lastInteractionData for None dataset:", newInteractionDataNone);
+        console.log("[DEBUG] 🎯 Setting lastInteractionData without sources:", newInteractionDataNone);
         setLastInteractionData(newInteractionDataNone);
+      } else {
+        // Sources were already received during streaming - interaction data should already be set
+        console.log("[DEBUG] ✅ Sources were received during streaming - skipping fallback fetch");
+        console.log("[DEBUG] ✅ Streaming sources should have proper document titles");
       }
 
-      console.log("[DEBUG] 📁 REACHED save process section");
-      console.log("[DEBUG] 📁 Current execution path completed, starting save");
-      
-      // **CRITICAL: Save chat history to backend after streaming completes**
-      console.log("[DEBUG] 🚀 STARTING SAVE PROCESS");
-      console.log("[DEBUG] 🕐 Timestamp:", new Date().toISOString());
-      try {
-        console.log("[DEBUG] 💾 Saving chat history to backend...");
-        console.log("[DEBUG] 👤 Current user ID:", uid);
-        console.log("[DEBUG] 💬 Current chat ID:", currentChatId);
-        console.log("[DEBUG] ❓ User message:", currentUserQuery);
-        console.log("[DEBUG] 🤖 Bot response length:", botMessage.length);
-          
-          // Critical check: Ensure we have user_id
-          if (!uid) {
-            console.error("❌ CRITICAL: user_id is null/undefined! Cannot save chat history.");
-            console.error("❌ This will cause a 400 error from the backend.");
-            return;
-          }
-          
-          // Format sources properly for backend
-          console.log("[DEBUG] 💾 Current lastInteractionData:", lastInteractionData);
-          let formattedSources = {};
-          if (lastInteractionData?.sources && Array.isArray(lastInteractionData.sources)) {
-            formattedSources = {
-              content: lastInteractionData.sourcesMarkdown || "",
-              pdf_elements: lastInteractionData.sources
-            };
-            
-            console.log("[DEBUG] 💾 Saving sources to backend:");
-            console.log("[DEBUG] 📄 sourcesMarkdown length:", lastInteractionData.sourcesMarkdown?.length || 0);
-            console.log("[DEBUG] 📑 pdf_elements count:", lastInteractionData.sources?.length || 0);
-            console.log("[DEBUG] 📋 Sample source:", lastInteractionData.sources?.[0]);
-          } else {
-            console.log("[DEBUG] ❌ No sources to save - lastInteractionData:", lastInteractionData);
-            console.log("[DEBUG] ❌ lastInteractionData.sources:", lastInteractionData?.sources);
-          }
-          
-          const response = await fetch('https://j1chatbotbeta.usgovvirginia.cloudapp.usgovcloudapi.net/api/chat_history', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'Authorization': sessionToken
-            },
-            body: JSON.stringify({
-              user_id: uid,
-              chat_id: currentChatId,
-              user_message: currentUserQuery,
-              bot_response: botMessage,
-              sources: formattedSources
-            })
-          });
-          
-          if (response.ok) {
-            console.log("[DEBUG] ✅ Chat history saved successfully");
-            const savedData = await response.json();
-            console.log("[DEBUG] Saved chat data:", savedData);
-            
-            // **CRITICAL: Reload chat messages to ensure persistence in UI**
-            console.log("[DEBUG] Reloading chat messages to sync with backend...");
-            await loadChatMessages(currentChatId);
-            console.log("[DEBUG] ✅ Chat messages reloaded after save");
-          } else {
-            console.error("[ERROR] Failed to save chat history:", response.status, await response.text());
-          }
-        } catch (saveError) {
-          console.error("[ERROR] Failed to save chat history:", saveError);
-        }
+      // **CHAT HISTORY IS NOW SAVED IMMEDIATELY AFTER STREAMING IN BACKEND**
+      // No need to save chat history here - it's handled automatically after streaming
+      console.log("[DEBUG] ✅ Chat history is saved automatically by backend after streaming");
+      console.log("[DEBUG] ✅ No separate save process needed in frontend");
 
     } catch (error) {
-      console.error("Error sending message:", error);
-      setMessages(prev => {
-        const updated = [...prev];
-        updated[messageIndex].content = "Error processing request.";
-        return updated;
+      console.error("[ERROR] Error in handleSendMessage:", error);
+      if (error.name === 'AbortError') {
+        console.log("[DEBUG] Request was aborted by user");
+        setMessages(prev => {
+          const updated = [...prev];
+          if (updated[messageIndex]) {
+            updated[messageIndex].content = "Request stopped by user.";
+          }
+          return updated;
+        });
+      } else {
+        setMessages(prev => {
+          const updated = [...prev];
+          if (updated[messageIndex]) {
+            updated[messageIndex].content = `Error: ${error.message}`;
+          }
+          return updated;
+        });
+      }
+      
+      // STREAMING NEVER BLOCKED: Remove from streaming tracking
+      setStreamingMessages(prev => {
+        const newSet = new Set(prev);
+        newSet.delete(messageId);
+        return newSet;
       });
-      setIsGenerating(false);
+      
+      // Clean up abort controller
+      setAbortControllers(prev => {
+        const newMap = new Map(prev);
+        newMap.delete(messageId);
+        return newMap;
+      });
     }
   };
 
@@ -965,6 +1245,8 @@ function ChatPage() {
       return "Mistral:7BQ";
     } else if (modelName === "sskostyaev/mistral:7b-instruct-v0.2-q6_K-32k") {
       return "mistral:small";
+    } else if (modelName === "mistral-STRATGPT:latest") {
+      return "STRATGPT";
     }
     return modelName; // Return the original name if no specific format is defined
   };
@@ -1265,10 +1547,85 @@ function ChatPage() {
     // Log the entire message object to debug
     console.log("getSourcesFromMessage - Full message:", JSON.stringify(message, null, 2));
     
-    // First check if message has direct sources attached
+    // First check if message has direct sources attached (array format)
     if (message.sources && Array.isArray(message.sources)) {
-      console.log("Using direct sources from message:", message.sources);
-      return message.sources;
+      console.log("Using direct sources from message (array format):", message.sources);
+      // Apply ENHANCED TITLE EXTRACTION to array format sources too
+      const enhancedSources = message.sources.map((source, index) => {
+        let title = source.name || source.title;
+        
+        // If no direct title, try to extract from pdf_url path
+        if (!title && source.pdf_url) {
+          const urlParts = source.pdf_url.split('/');
+          const fileName = urlParts[urlParts.length - 1];
+          if (fileName && fileName !== '') {
+            title = decodeURIComponent(fileName.replace(/\.pdf$/i, ''));
+          }
+        }
+        
+        // If still no title, try to extract from content
+        if (!title && source.content) {
+          const docMatch = source.content.match(/Document:\s*([^\s]+\.pdf)/i);
+          if (docMatch && docMatch[1]) {
+            title = docMatch[1];
+          }
+        }
+        
+        // Final fallback - but ONLY if truly no title
+        if (!title) {
+          title = `Document ${index + 1}`;
+        }
+        // DON'T convert "Unknown Document" to generic - keep it as is
+        
+        return {
+          title: title,
+          content: source.content || 'No content available',
+          pdf_url: source.pdf_url || ''
+        };
+      });
+      console.log("Enhanced direct sources titles:", enhancedSources.map(s => `"${s.title}"`));
+      return enhancedSources;
+    }
+    
+    // Handle object format: { content: "...", pdf_elements: [...] }
+    if (message.sources && typeof message.sources === 'object' && message.sources.pdf_elements && Array.isArray(message.sources.pdf_elements)) {
+      console.log("Found sources in object format, extracting pdf_elements:", message.sources.pdf_elements);
+      // Convert pdf_elements to the expected format using ENHANCED TITLE EXTRACTION
+      const convertedSources = message.sources.pdf_elements.map((element, index) => {
+        // ENHANCED TITLE EXTRACTION (same as streaming)
+        let title = element.name || element.title;
+        
+        // If no direct title, try to extract from pdf_url path
+        if (!title && element.pdf_url) {
+          const urlParts = element.pdf_url.split('/');
+          const fileName = urlParts[urlParts.length - 1];
+          if (fileName && fileName !== '' && fileName !== 'undefined') {
+            title = decodeURIComponent(fileName.replace(/\.pdf$/i, ''));
+          }
+        }
+        
+        // If still no title, try to extract from content
+        if (!title && element.content) {
+          const docMatch = element.content.match(/Document:\s*([^\s]+\.pdf)/i);
+          if (docMatch && docMatch[1]) {
+            title = docMatch[1];
+          }
+        }
+        
+        // Final fallback - but ONLY if truly no title
+        if (!title) {
+          title = `Document ${index + 1}`;
+        }
+        // DON'T convert "Unknown Document" to generic - keep it as is
+        
+        return {
+          title: title,
+          content: element.content || 'No content available',
+          pdf_url: element.pdf_url || ''
+        };
+      });
+      console.log("Converted sources from object format with enhanced titles:", convertedSources.map(s => `"${s.title}"`));
+      return convertedSources;
     }
     
     // If we have hasSources flag but no sourcesMarkdown, return empty
@@ -1279,13 +1636,41 @@ function ChatPage() {
     
     // Check if sourcesMarkdown is already a parsed object
     if (typeof message.sourcesMarkdown === 'object' && message.sourcesMarkdown !== null) {
-      // If it has pdf_elements, use those directly
+      // If it has pdf_elements, use those with enhanced title extraction
       if (Array.isArray(message.sourcesMarkdown.pdf_elements)) {
-        const sourceElements = message.sourcesMarkdown.pdf_elements.map(elem => ({
-          title: elem.name || '',
-          content: elem.content || ''
-        }));
-        console.log("Extracted source elements from pdf_elements:", sourceElements);
+        const sourceElements = message.sourcesMarkdown.pdf_elements.map((elem, index) => {
+          // ENHANCED TITLE EXTRACTION (same as streaming)
+          let title = elem.name || elem.title;
+          
+          // If no direct title, try to extract from pdf_url path
+          if (!title && elem.pdf_url) {
+            const urlParts = elem.pdf_url.split('/');
+            const fileName = urlParts[urlParts.length - 1];
+            if (fileName && fileName !== '' && fileName !== 'undefined') {
+              title = decodeURIComponent(fileName.replace(/\.pdf$/i, ''));
+            }
+          }
+          
+          // If still no title, try to extract from content
+          if (!title && elem.content) {
+            const docMatch = elem.content.match(/Document:\s*([^\s]+\.pdf)/i);
+            if (docMatch && docMatch[1]) {
+              title = docMatch[1];
+            }
+          }
+          
+          // Final fallback - but ONLY if truly no title
+          if (!title) {
+            title = `Document ${index + 1}`;
+          }
+          // DON'T convert "Unknown Document" to generic - keep it as is
+          
+          return {
+            title: title,
+            content: elem.content || ''
+          };
+        });
+        console.log("Extracted source elements from pdf_elements with enhanced titles:", sourceElements.map(s => `"${s.title}"`));
         return sourceElements;
       }
       // Otherwise return empty
@@ -1306,47 +1691,51 @@ function ChatPage() {
       [messageId]: !prev[messageId]
     }));
     
-    // Force refresh source count whenever dropdown is toggled
-    // Get the current message and update the sources count
-    const msg = messages[messageId];
-    if (msg && msg.sender === 'bot') {
-      const sources = getSourcesFromMessage(msg);
-      
-      // If we have sources, make sure they're properly counted
-      if (sources.length > 0) {
-        // Find the corresponding question number
-        const questionNumber = messages.slice(0, messageId).filter(m => m.sender === 'user').length;
+    // Force refresh source count whenever dropdown is toggled (only if not finalized)
+    if (!sourcesFinalized) {
+      // Get the current message and update the sources count
+      const msg = messages[messageId];
+      if (msg && msg.sender === 'bot') {
+        const sources = getSourcesFromMessage(msg);
         
-        // Update sourcesByQuestion to ensure we have the latest sources
-        setSourcesByQuestion(prev => {
-          const updated = { ...prev };
-          if (!updated[questionNumber]) {
-            updated[questionNumber] = [];
-          }
+        // If we have sources, make sure they're properly counted
+        if (sources.length > 0) {
+          // Find the corresponding question number
+          const questionNumber = messages.slice(0, messageId).filter(m => m.sender === 'user').length;
           
-          // Add any missing sources to the question
-          const currentTitles = new Set(updated[questionNumber].map(s => s.title));
-          let addedNew = false;
-          
-          sources.forEach(source => {
-            if (!currentTitles.has(source.title)) {
-              updated[questionNumber].push(source);
-              addedNew = true;
+          // Update sourcesByQuestion to ensure we have the latest sources
+          setSourcesByQuestion(prev => {
+            const updated = { ...prev };
+            if (!updated[questionNumber]) {
+              updated[questionNumber] = [];
             }
+            
+            // Add any missing sources to the question
+            const currentTitles = new Set(updated[questionNumber].map(s => s.title));
+            let addedNew = false;
+            
+            sources.forEach(source => {
+              if (!currentTitles.has(source.title)) {
+                updated[questionNumber].push(source);
+                addedNew = true;
+              }
+            });
+            
+            // Only return a new object if we actually changed something
+            return addedNew ? updated : prev;
           });
-          
-          // Only return a new object if we actually changed something
-          return addedNew ? updated : prev;
-        });
+        }
       }
+      
+      // Force recalculation of source count
+      setTimeout(() => {
+        // Use setTimeout to ensure this runs after state updates
+        const total = calculateTotalSources();
+        console.log("Source count updated after toggle:", total);
+      }, 0);
+    } else {
+      console.log("Sources are finalized, skipping recalculation on toggle");
     }
-    
-    // Force recalculation of source count
-    setTimeout(() => {
-      // Use setTimeout to ensure this runs after state updates
-      const total = calculateTotalSources();
-      console.log("Source count updated after toggle:", total);
-    }, 0);
   };
 
   // Toggle main sources panel
@@ -1445,8 +1834,8 @@ function ChatPage() {
     // This can happen if the full source object is passed instead of just markdown
     if (typeof markdown === 'object' && markdown.pdf_elements) {
       console.log("Found pdf_elements directly in source data");
-      return markdown.pdf_elements.map(elem => ({
-        title: elem.name || "Unnamed Source",
+      return markdown.pdf_elements.map((elem, index) => ({
+        title: elem.name || elem.title || `Document ${index + 1}`,
         content: elem.content || "No content available" 
       }));
     }
@@ -1457,11 +1846,11 @@ function ChatPage() {
       cleanedMarkdown = cleanedMarkdown.split('**Relevant Sources and Extracted Paragraphs:**')[1].trim();
     }
     
-    // NEW APPROACH: Look for the specific pattern: "**Source:** **Actual Title**"
-    // This format is coming directly from the database
+    // ENHANCED APPROACH: Look for the specific pattern: "**Source:** **Actual Title**"
+    // This format is coming directly from the streaming response
     const sourceMatches = cleanedMarkdown.match(/\*\*Source:\*\*\s+\*\*([^*]+)\*\*/g);
     if (sourceMatches && sourceMatches.length > 0) {
-      //console.log("Found source titles in specific format:", sourceMatches);
+      console.log("[DEBUG parseSourcesMarkdown] Found source titles in specific format:", sourceMatches.length);
       
       // Split the markdown into sections by the source pattern
       const sections = cleanedMarkdown.split(/\*\*Source:\*\*\s+\*\*[^*]+\*\*/);
@@ -1471,9 +1860,24 @@ function ChatPage() {
       sourceMatches.forEach((match, index) => {
         // Extract the title from the match pattern
         const titleMatch = match.match(/\*\*Source:\*\*\s+\*\*([^*]+)\*\*/);
-        let title = "Document";
+        let title = `Document ${index + 1}`; // Better fallback
+        
         if (titleMatch && titleMatch[1]) {
           title = titleMatch[1].trim();
+          
+          // ENHANCED TITLE CLEANING: Remove common prefixes and clean up
+          title = title
+            .replace(/^Source\s*\d*:?\s*/i, '') // Remove "Source 1:", "Source:", etc.
+            .replace(/^Document\s*\d*:?\s*/i, '') // Remove "Document 1:", "Document:", etc.
+            .replace(/\.pdf$/i, '') // Remove .pdf extension if present
+            .trim();
+          
+          // If title becomes empty after cleaning, use fallback
+          if (!title || title.length < 2) {
+            title = `Document ${index + 1}`;
+          }
+          
+          console.log("[DEBUG parseSourcesMarkdown] Cleaned title:", titleMatch[1], "→", title);
         }
         
         // Get the corresponding content section (skip the first section which appears before any source)
@@ -1484,13 +1888,19 @@ function ChatPage() {
           content = content.split('**Extracted Paragraph:**')[1].trim();
         }
         
+        // Clean up content by removing PDF links and extra whitespace
+        if (content.includes('View full PDF:')) {
+          content = content.split('View full PDF:')[0].trim();
+        }
+        
         // Skip if content is too short
         if (content.length >= 5) {
           sources.push({ title, content });
         }
       });
       
-      console.log(`Parsed ${sources.length} sources using specific format:`, sources);
+      console.log(`[DEBUG parseSourcesMarkdown] Parsed ${sources.length} sources with enhanced titles:`, 
+                  sources.map(s => ({ title: s.title, contentLength: s.content.length })));
       return sources;
     }
     
@@ -1547,16 +1957,32 @@ function ChatPage() {
 
   // Add function to handle stopping generation
   const handleStopGeneration = () => {
-    if (abortControllerRef.current) {
-      abortControllerRef.current.abort();
-      abortControllerRef.current = null;
-    }
+    console.log("[DEBUG] 🛑 Stopping current streaming requests");
+    
+    // Stop all current streaming requests
+    abortControllers.forEach((controller, messageId) => {
+      console.log("[DEBUG] 🛑 Aborting stream:", messageId);
+      controller.abort();
+    });
+    
+    // Clear all tracking
+    setAbortControllers(new Map());
+    setStreamingMessages(new Set());
+    
+    console.log("[DEBUG] 🛑 All streams stopped - UI remains responsive for new requests");
   };
 
   // Update the toggleSourcesDropdown function to work with our new flexbox layout
   const toggleSourcesDropdown = useCallback(() => {
     // If we're opening the dropdown, refresh all the source data first
     if (!showSourcesDropdown) {
+      // RESPECT FINALIZED SOURCES: Skip refresh if sources are already finalized
+      if (sourcesFinalized) {
+        console.log("Sources are finalized, skipping refresh before showing dropdown");
+        setShowSourcesDropdown(true);
+        return;
+      }
+      
       console.log("Refreshing sources data before showing dropdown");
       
       // Get the current question number (total user messages)
@@ -1640,8 +2066,8 @@ function ChatPage() {
       const total = calculateTotalSources();
       setSourcesCount(total);
       
-      // Force UI refresh
-      setForceUpdate(prev => prev + 1);
+      // Force UI refresh (don't interfere with aggressive refresh trigger)
+      setForceUpdate(prev => prev < 100 ? prev + 1 : prev);
       
       // Scroll to the current question after we show the panel
       setTimeout(() => {
@@ -1658,7 +2084,7 @@ function ChatPage() {
     
     // Toggle the dropdown visibility
     setShowSourcesDropdown(prev => !prev);
-  }, [messages, showSourcesDropdown]);
+  }, [messages, showSourcesDropdown, sourcesFinalized]);
 
   // Add a useEffect to process initial messages and extract sources on component mount
   useEffect(() => {
@@ -1719,6 +2145,12 @@ function ChatPage() {
 
   // Add this new useEffect hook to update the sources button after sources are fetched
   useEffect(() => {
+    // RESPECT FINALIZED SOURCES: Only recalculate if sources are not finalized
+    if (sourcesFinalized) {
+      console.log("Sources are finalized, skipping recalculation");
+      return;
+    }
+    
     // This useEffect will run whenever sourceContent, sourcesByQuestion, or allUniqueSources changes
     // It forces a recalculation of the total source count whenever any source-related state changes
     if (messages.length > 0 && (sourceContent || Object.keys(sourcesByQuestion).length > 0)) {
@@ -1730,26 +2162,38 @@ function ChatPage() {
       // Force a minimal state update to ensure UI refreshes
       setMessages(prevMessages => [...prevMessages]);
     }
-  }, [sourceContent, sourcesByQuestion, allUniqueSources]);
+  }, [sourceContent, sourcesByQuestion, allUniqueSources, sourcesFinalized]);
 
   // Modify the calculateTotalSources function to be more thorough
   const calculateTotalSources = () => {
     let total = 0;
     
+    console.log("[DEBUG calculateTotalSources] 🔢 Starting calculation...");
+    console.log("[DEBUG calculateTotalSources] 📋 sourcesByQuestion:", sourcesByQuestion);
+    console.log("[DEBUG calculateTotalSources] 📋 sourcesByQuestion keys:", Object.keys(sourcesByQuestion));
+    
     // First, count sources from the sourcesByQuestion object
-    Object.values(sourcesByQuestion).forEach(sourcesArray => {
+    Object.values(sourcesByQuestion).forEach((sourcesArray, index) => {
       if (Array.isArray(sourcesArray)) {
+        console.log(`[DEBUG calculateTotalSources] 📄 Question ${index}: ${sourcesArray.length} sources`);
         total += sourcesArray.length;
       }
     });
     
-    // Then, also check messages directly for any sources we might have missed
-    messages.forEach(msg => {
-      if (msg.sender === 'bot') {
-        // Check for sources in various possible locations
-        if (msg.sources && Array.isArray(msg.sources)) {
+    // Check all messages for any additional sources not tracked in sourcesByQuestion
+    console.log(`[DEBUG calculateTotalSources] 📄 Checking ${messages.length} messages for additional sources`);
+    messages.forEach((msg, msgIndex) => {
+      if (msg.sender === 'bot' && (msg.hasSources || msg.sources)) {
+        console.log(`[DEBUG calculateTotalSources] 📄 Checking bot message ${msgIndex}`);
+        
+        // Use getSourcesFromMessage to extract sources consistently
+        const messageSources = getSourcesFromMessage(msg);
+        
+        if (messageSources && messageSources.length > 0) {
+          console.log(`[DEBUG calculateTotalSources] 📄 Message ${msgIndex} has ${messageSources.length} sources`);
+          
           // Only count sources that weren't already counted via sourcesByQuestion
-          msg.sources.forEach(source => {
+          messageSources.forEach(source => {
             if (source && source.title) {
               // Check if this source is already counted in sourcesByQuestion
               let isDuplicate = false;
@@ -1761,34 +2205,11 @@ function ChatPage() {
               });
               
               if (!isDuplicate) {
+                console.log(`[DEBUG calculateTotalSources] 📄 Adding uncounted source: "${source.title}"`);
                 total += 1;
               }
             }
           });
-        }
-        
-        // Also check if message has sourcesMarkdown but no parsed sources yet
-        if (msg.sourcesMarkdown && !msg.sources && (!msg.hasSources || msg.hasSources === true)) {
-          // Try to parse sources from markdown
-          const parsedSources = parseSourcesMarkdown(msg.sourcesMarkdown);
-          if (parsedSources.length > 0) {
-            // Check for duplicates before counting
-            parsedSources.forEach(source => {
-              if (source && source.title) {
-                let isDuplicate = false;
-                Object.values(sourcesByQuestion).forEach(sourcesArray => {
-                  if (Array.isArray(sourcesArray) && 
-                      sourcesArray.some(s => s.title === source.title)) {
-                    isDuplicate = true;
-                  }
-                });
-                
-                if (!isDuplicate) {
-                  total += 1;
-                }
-              }
-            });
-          }
         }
       }
     });
@@ -1832,6 +2253,12 @@ function ChatPage() {
 
   // Create a dedicated useEffect to refresh sources after a bot message is added
   useEffect(() => {
+    // RESPECT FINALIZED SOURCES: Skip recalculation if sources are finalized
+    if (sourcesFinalized) {
+      console.log("Sources are finalized, skipping bot message sources refresh");
+      return;
+    }
+    
     // Check if the most recent message is from the bot
     const lastMessage = messages[messages.length - 1];
     if (lastMessage && lastMessage.sender === 'bot') {
@@ -1995,13 +2422,143 @@ function ChatPage() {
 
   // Add a useEffect that updates sourcesCount whenever relevant data changes
   useEffect(() => {
+    // RESPECT FINALIZED SOURCES: Only calculate once during streaming, then preserve
+    if (sourcesFinalized && sourcesCount > 0) {
+      console.log("[DEBUG useEffect sourcesCount] 🔒 Sources are finalized with count:", sourcesCount, "- preserving state");
+      return;
+    }
+    
+    console.log("[DEBUG useEffect sourcesCount] 🔄 Sources data changed, recalculating...");
+    console.log("[DEBUG useEffect sourcesCount] 📊 sourcesFinalized:", sourcesFinalized);
+    console.log("[DEBUG useEffect sourcesCount] 📊 Messages count:", messages.length);
+    console.log("[DEBUG useEffect sourcesCount] 📊 SourcesByQuestion keys:", Object.keys(sourcesByQuestion));
+    console.log("[DEBUG useEffect sourcesCount] 📊 AllUniqueSources count:", allUniqueSources.length);
+    
     // Update the sourcesCount state whenever sources change
     const total = calculateTotalSources();
-    setSourcesCount(total);
+    console.log("[DEBUG useEffect sourcesCount] 🎯 Calculated total:", total);
+    
+    // **ENHANCED ANTI-GLITCH PROTECTION**: Don't reset count incorrectly
+    // This prevents the count from incorrectly dropping during streaming or incomplete data loading
+    if (total > 0) {
+      // Always update if we have a positive count
+      console.log("[DEBUG useEffect sourcesCount] ✅ Setting sources count to:", total, "(positive count)");
+      setSourcesCount(total);
+    } else if (streamingMessages.size === 0 && (Object.keys(sourcesByQuestion).length === 0 || messages.length <= 1)) {
+      console.log("[DEBUG useEffect sourcesCount] 🎯 No sources and no active streams - setting count to 0");
+      setSourcesCount(0);
+    } else {
+      console.log("[DEBUG useEffect sourcesCount] ⚠️ Active streams:", streamingMessages.size, "sourcesByQuestion keys:", Object.keys(sourcesByQuestion), "messages:", messages.length);
+    }
     
     // Force a re-render of the entire component to ensure all UI elements update
-    setTimeout(() => setForceUpdate(prev => prev + 1), 100);
-  }, [messages, sourceContent, sourcesByQuestion, allUniqueSources, forceUpdate]);
+    // But don't interfere with aggressive refresh trigger (forceUpdate > 100)
+    setTimeout(() => {
+      setForceUpdate(prev => prev < 100 ? prev + 1 : prev);
+    }, 100);
+  }, [messages, sourceContent, sourcesByQuestion, allUniqueSources, forceUpdate, streamingMessages, sourcesFinalized, sourcesCount]);
+
+  // AGGRESSIVE REFRESH: useEffect triggered after streaming to fix title display
+  useEffect(() => {
+    // Only trigger aggressive refresh when forceUpdate > 100 (streaming completion signal)
+    if (forceUpdate > 100 && !sourcesFinalized && messages.length > 0) {
+      console.log("[DEBUG useEffect AGGRESSIVE REFRESH] 🔄 TRIGGERED - Re-processing all messages with current state");
+      console.log("[DEBUG useEffect AGGRESSIVE REFRESH] 📊 Current messages count:", messages.length);
+      console.log("[DEBUG useEffect AGGRESSIVE REFRESH] 📊 Messages with sources:", messages.filter(m => m.sender === 'bot' && (m.hasSources || m.sources)).length);
+      
+      const tempSourcesByQuestion = {};
+      const allMessageSources = [];
+      let totalProcessedSources = 0;
+      
+      // Scan through all messages to collect sources with proper titles
+      messages.forEach((msg, idx) => {
+        if (msg.sender === 'bot' && (msg.hasSources || msg.sourcesMarkdown || (msg.sources && msg.sources.length > 0))) {
+          // Find the corresponding user message index  
+          const prevUserMsgs = messages.slice(0, idx).filter(m => m.sender === 'user').length;
+          const questionNum = prevUserMsgs;
+          
+          console.log(`[DEBUG AGGRESSIVE REFRESH] 🔄 Processing bot message ${idx} for question ${questionNum}`);
+          
+          // Get sources using the SAME ENHANCED logic as streaming processing
+          let sources = [];
+          if (msg.sources && Array.isArray(msg.sources)) {
+            sources = msg.sources.map((s, idx) => {
+              // ENHANCED TITLE EXTRACTION (same as streaming)
+              let title = s.name || s.title;
+              
+              // If no direct title, try to extract from pdf_url path
+              if (!title && s.pdf_url) {
+                const urlParts = s.pdf_url.split('/');
+                const fileName = urlParts[urlParts.length - 1];
+                if (fileName && fileName !== '' && fileName !== 'undefined') {
+                  title = decodeURIComponent(fileName.replace(/\.pdf$/i, ''));
+                }
+              }
+              
+              // If still no title, try to extract from content
+              if (!title && s.content) {
+                const docMatch = s.content.match(/Document:\s*([^\s]+\.pdf)/i);
+                if (docMatch && docMatch[1]) {
+                  title = docMatch[1];
+                }
+              }
+              
+              // Final fallback - but ONLY if truly no title
+              if (!title) {
+                title = `Document ${idx + 1}`;
+              }
+              // DON'T convert "Unknown Document" to generic - keep it as is
+              
+              return {
+                title: title,
+                content: s.content || 'No content available',
+                pdf_url: s.pdf_url || ''
+              };
+            });
+          } else if (msg.sourcesMarkdown) {
+            sources = parseSourcesMarkdown(msg.sourcesMarkdown);
+          }
+          
+          console.log(`[DEBUG AGGRESSIVE REFRESH] 🔄 Found ${sources.length} sources for question ${questionNum}:`, sources.map(s => `"${s.title}"`));
+          
+          if (sources.length > 0) {
+            // Ensure this question has an entry
+            if (!tempSourcesByQuestion[questionNum]) {
+              tempSourcesByQuestion[questionNum] = [];
+            }
+            
+            // Add each source, avoiding duplicates
+            sources.forEach(source => {
+              if (source && source.title) {
+                const existingSource = tempSourcesByQuestion[questionNum].find(s => s.title === source.title);
+                if (!existingSource) {
+                  tempSourcesByQuestion[questionNum].push(source);
+                  allMessageSources.push(source);
+                  totalProcessedSources++;
+                  console.log(`[DEBUG AGGRESSIVE REFRESH] 🔄 Added source: "${source.title}" to question ${questionNum}`);
+                }
+              }
+            });
+          }
+        }
+      });
+      
+      console.log("[DEBUG AGGRESSIVE REFRESH] 🔄 RESULTS:");
+      console.log("[DEBUG AGGRESSIVE REFRESH] 🔄 Total sources processed:", totalProcessedSources);
+      console.log("[DEBUG AGGRESSIVE REFRESH] 🔄 Questions with sources:", Object.keys(tempSourcesByQuestion));
+      console.log("[DEBUG AGGRESSIVE REFRESH] 🔄 All source titles:", allMessageSources.map(s => `"${s.title}"`));
+      
+      // Force update all source-related state with refreshed data
+      setSourcesByQuestion(tempSourcesByQuestion);
+      setAllUniqueSources([...allMessageSources]); // Create new array to force update
+      
+      // Update sources count
+      const totalSources = Object.values(tempSourcesByQuestion).reduce((acc, sources) => acc + sources.length, 0);
+      setSourcesCount(totalSources);
+      
+      console.log("[DEBUG AGGRESSIVE REFRESH] 🔄 ✅ Updated all source state - titles should now display immediately");
+    }
+  }, [forceUpdate, sourcesFinalized, messages]);
 
   // Add useEffect hook for Persona -> Dataset logic (around line 1080)
   useEffect(() => {
@@ -2413,13 +2970,14 @@ function ChatPage() {
                     color="inherit"
                     onClick={() => handleSelectChat(chat.id)}
                     sx={{
-                      backgroundColor: '#0D1B2A',
+                      backgroundColor: selectedChat === chat.id ? '#2E3E57' : '#0D1B2A', // Lighter shade for selected chat
                       color: '#FFFFFF',
                       fontWeight: 'bold',
                       textTransform: 'none',
                       width: '100%',
+                      border: selectedChat === chat.id ? '2px solid #4A6A8A' : '2px solid transparent', // Add border for selected chat
                       '&:hover': {
-                        backgroundColor: '#1B263B',
+                        backgroundColor: selectedChat === chat.id ? '#3A4F68' : '#1B263B',
                       },
                     }}
                   >
@@ -2785,6 +3343,27 @@ function ChatPage() {
                                                 borderBottom: '1px solid #1B263B'
                                               }}>
                                                 <ReactMarkdown>{source.content}</ReactMarkdown>
+                                                {/* Add PDF link if available */}
+                                                {source.pdf_url && (
+                                                  <div style={{ 
+                                                    marginTop: '8px', 
+                                                    paddingTop: '8px', 
+                                                    borderTop: '1px solid #1B263B' 
+                                                  }}>
+                                                    <a 
+                                                      href={source.pdf_url} 
+                                                      target="_blank" 
+                                                      rel="noopener noreferrer"
+                                                      style={{ 
+                                                        color: '#4A90E2', 
+                                                        textDecoration: 'underline',
+                                                        fontSize: '0.9rem'
+                                                      }}
+                                                    >
+                                                      📄 View Full PDF
+                                                    </a>
+                                                  </div>
+                                                )}
                                               </div>
                                             )}
                                           </div>
@@ -3041,22 +3620,8 @@ function ChatPage() {
                 placeholder="Type your message here..." 
                 style={{ flexGrow: 1, padding: '8px', backgroundColor: '#0D1B2A', color: '#FFFFFF', border: '1px solid #1B263B', borderRadius: '4px',  outline: 'none', height: '40px', fontSize:'16px'}}
               />
-              {isGenerating ? (
-                <Button
-                  sx={{
-                    padding: '8px 16px',
-                    backgroundColor: '#9c1f1f',
-                    color: '#FFFFFF',
-                    fontWeight: 'bold',
-                    '&:hover': {
-                      backgroundColor: '#771717',
-                    },
-                  }}
-                  onClick={handleStopGeneration}
-                >
-                  Stop
-                </Button>
-              ) : (
+              <div style={{ display: 'flex', gap: '8px' }}>
+                {/* STREAMING NEVER BLOCKED: Always allow new messages */}
                 <Button
                   sx={{
                     padding: '8px 16px',
@@ -3071,7 +3636,25 @@ function ChatPage() {
                 >
                   Send
                 </Button>
-              )}
+                
+                {/* Show stop button only if there are active streams */}
+                {streamingMessages.size > 0 && (
+                  <Button
+                    sx={{
+                      padding: '8px 16px',
+                      backgroundColor: '#9c1f1f',
+                      color: '#FFFFFF',
+                      fontWeight: 'bold',
+                      '&:hover': {
+                        backgroundColor: '#771717',
+                      },
+                    }}
+                    onClick={handleStopGeneration}
+                  >
+                    Stop ({streamingMessages.size})
+                  </Button>
+                )}
+              </div>
             </div>
           </div>
         </div>
@@ -3190,6 +3773,27 @@ function ChatPage() {
                               borderBottom: '1px solid #1B263B'
                             }}>
                               <ReactMarkdown>{source.content}</ReactMarkdown>
+                              {/* Add PDF link if available */}
+                              {source.pdf_url && (
+                                <div style={{ 
+                                  marginTop: '8px', 
+                                  paddingTop: '8px', 
+                                  borderTop: '1px solid #1B263B' 
+                                }}>
+                                  <a 
+                                    href={source.pdf_url} 
+                                    target="_blank" 
+                                    rel="noopener noreferrer"
+                                    style={{ 
+                                      color: '#4A90E2', 
+                                      textDecoration: 'underline',
+                                      fontSize: '0.9rem'
+                                    }}
+                                  >
+                                    📄 View Full PDF
+                                  </a>
+                                </div>
+                              )}
                             </div>
                           )}
                         </div>
